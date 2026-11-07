@@ -21,6 +21,7 @@ security system need a 1 s hold. Writes show at once and revert (key flashes red
   uv run deck.py demo    # same deck against a fake home, no hub needed
   uv run deck.py test    # self-check, no hardware and no network needed
   uv run deck.py shots   # write PNG renders of some pages to /tmp/homedeck-*.png
+  uv run deck.py shots --live   # the same for the real home (paired hubs, not tado): /tmp/homedeck-live-*.png
 """
 import argparse
 import base64
@@ -71,7 +72,7 @@ TADO_TERMINATION = {"type": "TADO_MODE"}  # overlay ends at the next time block,
 TADO_TERMINATION_FALLBACK = {"type": "MANUAL"}  # used once when tado answers HTTP 422 to the line above
 TADO_DEFAULT_TARGET = 21.0  # degrees when "Heat" is chosen and tado has no target yet
 IKEA_BLINDS_INVERTED = True  # DIRIGERA: blindsTargetLevel 0 = open, 100 = closed (unverified). HAP: 100 = open
-PAIR_SECONDS, PAIR_STEP = 60, 2  # pairing: how long and how often the hub is asked
+PAIR_SECONDS, PAIR_STEP = 180, 2  # pairing: how long and how often the hub is asked
 TADO_CLIENT = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 # HAP short UUIDs of the services and characteristics (Apple's base UUID is added by HomeKit).
@@ -575,7 +576,8 @@ def dev_key(ui, d):
         k.update(cat="climate", on=True)
     elif kind in SENSORS:
         hot = ui.hazard(d) or (kind == "contact" and v(CONTACT) == 1)
-        k.update(cat="sensor", on=bool(hot), rgb=ALERT_RGB if hot else None)
+        moving = kind in ("motion", "occupancy") and bool(v(MOTION if kind == "motion" else OCC))
+        k.update(cat="sensor", on=bool(hot or moving), rgb=ALERT_RGB if hot else WARN_RGB if moving else None)
     else:
         rgb = {"lock": SAFE_RGB if v(LOCKC) == 1 else WARN_RGB, "security": INFO_RGB if v(SECC, 3) != 3 else SAFE_RGB}.get(kind)
         k.update(cat="dev", on=ui.is_on(d) or kind in HOLD_KINDS, rgb=rgb or DEVICE_RGB.get(kind, SAFE_RGB))
@@ -597,10 +599,10 @@ def sensor_face(ui, d):
     if kind == "air":
         return dict(sub=f"{v(PM25) or 0:.0f}µg")
     if kind == "contact":
-        return dict(glyph="door_open", fill=RED, sub="open") if v(CONTACT) == 1 else dict(glyph="door", sub="shut")
+        return dict(glyph="door_open", fill=RED, sub="Open") if v(CONTACT) == 1 else dict(glyph="door", sub="Closed")
     if kind in ("motion", "occupancy"):
         on = bool(v(MOTION if kind == "motion" else OCC))
-        return dict(fill=ORANGE if on else DARK, sub="yes" if on else "no")
+        return dict(fill=ORANGE if on else DARK, sub="Motion" if on else "Clear")
     if on := ui.hazard(d):
         return dict(fill=RED, sub="ALARM")
     return dict(sub="ok")
@@ -726,15 +728,58 @@ def p_status(ui):
 
 # --- drawing ---
 
+SYS = "/System/Library/Fonts/"
+FONT_CHAIN = {  # weight -> (file, variation name of a variable font or face index of a collection), first that loads wins
+    "label": [(SYS + "SFNS.ttf", "Medium"), (SYS + "HelveticaNeue.ttc", 10), (SYS + "Supplemental/Arial Bold.ttf", 0)],
+    "bold": [(SYS + "SFNS.ttf", "Bold"), (SYS + "HelveticaNeue.ttc", 1), (SYS + "Supplemental/Arial Bold.ttf", 0)]}
+
+
 @functools.lru_cache(maxsize=None)
-def font(size):
+def font(size, weight="label"):
+    """System font of a weight ("label" = semibold/medium, "bold"); the PIL default when none loads."""
     from PIL import ImageFont
+    for path, how in FONT_CHAIN[weight]:
+        try:
+            f = ImageFont.truetype(path, size, index=how if isinstance(how, int) else 0)
+            if isinstance(how, str):
+                f.set_variation_by_name(how)
+            return f
+        except (OSError, ValueError, AttributeError):
+            continue
     return ImageFont.load_default(size=size)
 
 
 def bold(d, xy, text, size, fill, anchor="mm"):
-    """Bold text: the default font has no bold face, so a 1 px stroke thickens it."""
-    d.text(xy, text, font=font(size), fill=fill, anchor=anchor, stroke_width=1, stroke_fill=fill)
+    d.text(xy, text, font=font(size, "bold"), fill=fill, anchor=anchor)
+
+
+def wrap(text, f, width=68, n=2):
+    """Lines of `text` (\\n breaks too) that fit `width` px; more than n lines end with an ellipsis."""
+    rows = []
+    for part in text.split("\n"):
+        cur = ""
+        for word in part.split():
+            while f.getlength(word) > width:  # a word wider than the key breaks
+                k = max(1, len(word) - 1)
+                while k > 1 and f.getlength(word[:k]) > width:
+                    k -= 1
+                if cur:
+                    rows.append(cur)
+                    cur = ""
+                rows.append(word[:k])
+                word = word[k:]
+            if cur and f.getlength(f"{cur} {word}") > width:
+                rows.append(cur)
+                cur = ""
+            cur = f"{cur} {word}".strip()
+        rows.append(cur)
+    if len(rows) > n:
+        rows = rows[:n]
+        last = rows[-1]
+        while last and f.getlength(last + "…") > width:
+            last = last[:-1]
+        rows[-1] = last.rstrip() + "…"
+    return rows
 
 
 def glyph(d, name, cx, cy, size, fg):
@@ -1018,22 +1063,30 @@ def face(key, size=72, theme=None):
     else:
         ink, txt, bar, badge = paint(img, key, theme)
         d = ImageDraw.Draw(img)
-        lines = [w for part in key.label.split("\n") for w in (textwrap.wrap(part, 11) or [""])]
-        bottom = size - 11 if key.bar is not None else size - 4
+        # Layout at 72 px. Zone A (y 0-40): an icon (26 px) or a value (20 px bold), or a small 14 px icon at the
+        # top left plus the value. Zone B (y 40-68): the label, at most 2 lines of 11 px. The bar is at the very bottom.
         if key.glyph is None and not key.sub:  # text only: centered
-            f = font(15 if len(lines) <= 2 else 12)
-            d.multiline_text((size / 2, size / 2), "\n".join(lines[:4]), font=f, fill=ink, anchor="mm", align="center")
+            f = font(15)
+            rows = wrap(key.label, f, 64, 4)
+            if len(rows) > 2:
+                f = font(12)
+                rows = wrap(key.label, f, 64, 4)
+            d.multiline_text((size / 2, size / 2), "\n".join(rows), font=f, fill=ink, anchor="mm", align="center")
         else:
-            d.multiline_text((size / 2, bottom), "\n".join(lines[:2]), font=font(11), fill=txt, anchor="md", align="center")
-            if key.sub and key.glyph:
-                glyph(d, key.glyph, 12, 13, 7, ink)
-                bold(d, (size / 2 + 4, 26), key.sub, 17 if len(key.sub) <= 4 else 13, ink)
-            elif key.sub:
-                bold(d, (size / 2, 25), key.sub, 17 if len(key.sub) <= 4 else 13, ink)
+            baseline = size - 11 if key.bar is not None else size - 7  # last label line; its descenders end above the bar
+            for i, row in enumerate(reversed(wrap(key.label, font(11), 68, 2))):
+                d.text((size / 2, baseline - i * 13), row, font=font(11), fill=txt, anchor="ms")
+            if key.sub:
+                px = 20
+                while px > 10 and font(px, "bold").getlength(key.sub) > 64:
+                    px -= 1
+                if key.glyph:
+                    glyph(d, key.glyph, 11, 11, 7, ink)
+                bold(d, (size / 2, 25 if key.glyph else 20), key.sub, px, ink)
             else:
-                glyph(d, key.glyph, size / 2, 23, 12, ink)
+                glyph(d, key.glyph, size / 2, 20, 13, ink)
         if key.hint:
-            d.text((3, 2), key.hint, font=font(10), fill=(255, 210, 0))
+            d.text((3, 2), key.hint, font=font(9), fill=(255, 210, 0))
         if key.bar is not None:  # 3 px level bar
             d.rounded_rectangle((8, size - 7, size - 9, size - 5), 1, fill=tuple(round(c * .3 + 25) for c in ink))
             d.rounded_rectangle((8, size - 7, 8 + (size - 17) * max(0.0, min(1.0, key.bar)), size - 5), 1, fill=bar or ink)
@@ -2292,6 +2345,12 @@ def run(deck, events, link):
             pass  # the deck is already gone
 
 
+def paired_hub(events, skip=()):
+    """The Hub of all paired hubs (except the `skip` names), not started yet."""
+    store = Creds()
+    return Hub(events, [cls(cfg, store) for name, cls in SOURCES.items() if name not in skip and (cfg := store.get(name))])
+
+
 def serve(demo=False):
     from StreamDeck.DeviceManager import DeviceManager
     from StreamDeck.Transport.Transport import TransportError
@@ -2300,8 +2359,7 @@ def serve(demo=False):
     if demo:
         link = FakeBridge(events)
     else:
-        store = Creds()
-        link = Hub(events, [cls(cfg, store) for name, cls in SOURCES.items() if (cfg := store.get(name))])
+        link = paired_hub(events)
         if not link.sources:
             log("No hub is paired. Run: stream-deck-home pair hue|ikea|tado")
     link.start()
@@ -2687,7 +2745,7 @@ def test():
     ceiling = r[2]
     assert ceiling.tap[0] == "toggle" and ceiling.long == ("goto", ("detail", "ceiling", 0)) and ceiling.fill == light_color(True, None, None, 80)
     assert r[3].fill == light_color(True, 30, 80, 60, 300) and r[3].bar == 0.6
-    assert r[5].tap is None and r[5].long is None and r[5].sub == "no"  # sensor does nothing
+    assert r[5].tap is None and r[5].long is None and r[5].sub == "Clear"  # sensor does nothing
     assert r[4].tap == r[4].long and r[6].tap[0] == "goto"  # blinds and thermostat open the detail page
     ui.act(("back",), "", 0)
     ui.act(k[9].tap, "", 0)  # hallway: lock, garage, security need a hold
@@ -2717,7 +2775,7 @@ def test():
     assert s[0].label == "Back" and all(x.tap is None for x in s[1:] if x.badge == "" and not x.low)
     assert [x.label for x in s if x.badge == "!"] == ["Bedside right"] and [x.label for x in s if x.glyph == "battery"] == ["Window contact"]
     assert any(x.label == "Office temp" and x.sub == "20.5°" for x in s) and any(x.label == "Daylight" and x.sub == "120lx" for x in s)
-    assert any(x.label == "Window contact" and x.sub == "open" and x.fill == RED for x in s)
+    assert any(x.label == "Window contact" and x.sub == "Open" and x.fill == RED for x in s)
     ui2.act(next(x for x in s if x.badge == "!").tap, "", 0)
     assert ui2.page == ("room", "bedroom", 0) and len(ui2.stack) == 2
     # optimistic update, success and failure
@@ -2927,6 +2985,35 @@ def shots(out="/tmp"):
                 print(f"{out}/homedeck-{theme}-{name}.png")
 
 
+def shots_live(out="/tmp"):
+    """Render the real home (home, every room, scenes, status) to PNGs without opening the deck.
+    tado is left out: its refresh token rotates, so a second client would break a running `serve`."""
+    events = queue.Queue()
+    hub = paired_hub(events, skip=("tado",))
+    if not hub.sources:
+        sys.exit("No Hue or DIRIGERA hub is paired.")
+    hub.start()
+    deadline = time.time() + 20
+    while time.time() < deadline and not all(s.online for s in hub.sources):
+        time.sleep(0.2)
+    if not any(s.online for s in hub.sources):
+        sys.exit("No hub answered within 20 s.")
+    ui = UI(hub)
+    ui.on_msg(hub.snapshot(), 0.0)
+    pages = [("home", ("home", 0)), ("scenes", ("scenes", 0)), ("status", ("status", 0))]
+    pages[1:1] = [("room-" + re.sub(r"\W+", "-", r["name"].lower()).strip("-"), ("room", r["id"], 0)) for r in ui.home()["rooms"]]
+    for name, page in pages:
+        n = count = 0
+        while n <= count:  # a page with more keys than fit pages on key 14
+            ui.stack = [("home", 0), page[:-1] + (n,)] if page[0] != "home" else [page]
+            keys = ui.keys(0)
+            count = keys[14].tap[1] - 1 if keys[14].tap and keys[14].tap[0] == "flip" else 0
+            path = f"{out}/homedeck-live-{name}{'' if n == 0 else f'-{n + 1}'}.png"
+            sheet(keys).save(path)
+            print(path)
+            n += 1
+
+
 # --- pairing and status ---
 
 def hostname():
@@ -2935,6 +3022,24 @@ def hostname():
 
 def pkce_challenge(verifier):
     return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+def wait_reachable(host, port):
+    """Retry the TCP connect until PAIR_SECONDS pass. macOS blocks a new program from the local
+    network ("No route to host") until the user allows it in the Local Network dialog."""
+    deadline, told = time.time() + PAIR_SECONDS, False
+    while True:
+        try:
+            socket.create_connection((host, port), 5).close()
+            return
+        except OSError as e:
+            if time.time() >= deadline:
+                sys.exit(f"Cannot reach {host}:{port} ({e}). Allow this program in System Settings > "
+                         "Privacy & Security > Local Network, then run the command again.")
+            if not told:
+                print(f"Cannot reach {host}:{port} yet ({e}). If macOS asks for Local Network access, allow it.")
+                told = True
+            time.sleep(PAIR_STEP)
 
 
 def pair_hue(host=None):
@@ -2946,7 +3051,8 @@ def pair_hue(host=None):
             sys.exit("No Hue Bridge found. Run the command again with --host <ip>.")
         host = found["host"]
         print(f"Found the Hue Bridge at {host}.")
-    print("Press the round link button on the Hue Bridge now. Waiting up to 60 seconds...")
+    wait_reachable(host, 443)
+    print(f"Press the round link button on the Hue Bridge now. Waiting up to {PAIR_SECONDS} seconds...")
     pin, key, deadline = None, None, time.time() + PAIR_SECONDS
     while key is None:
         conn = https(host, 443, pin, first_use=pin is None)  # later attempts must see the same certificate
@@ -2980,6 +3086,7 @@ def pair_ikea(host=None):
         if not host:
             sys.exit("No DIRIGERA hub found. Run the command again with --host <ip>.")
         print(f"Found the DIRIGERA hub at {host}.")
+    wait_reachable(host, 8443)
     verifier = secrets.token_urlsafe(96)  # 128 characters
     query = urllib.parse.urlencode({"audience": "homesmart.local", "response_type": "code",
                                     "code_challenge": pkce_challenge(verifier), "code_challenge_method": "S256"})
@@ -2992,15 +3099,18 @@ def pair_ikea(host=None):
     code = dig(obj, "code")
     if not code:
         sys.exit("The DIRIGERA hub gave no pairing code.")
-    print("Press the action button on the DIRIGERA hub now. Waiting up to 60 seconds...")
+    print(f"Press the action button on the DIRIGERA hub now. Waiting up to {PAIR_SECONDS} seconds...")
     deadline = time.time() + PAIR_SECONDS
     while True:
         st, obj, _ = hub_call(host, 8443, pin, "POST", "/v1/oauth/token", form={
             "code": code, "name": hostname(), "grant_type": "authorization_code", "code_verifier": verifier})
         if dig(obj, "access_token"):
             break
+        if os.environ.get("PAIR_DEBUG"):
+            print(f"  hub answered HTTP {st}: {obj}")
         if time.time() >= deadline:
-            sys.exit("The action button was not pressed in time. Run the command again.")
+            sys.exit(f"The action button was not pressed in time (last answer: HTTP {st} {obj}). "
+                     "Run the command again.")
         time.sleep(PAIR_STEP)
     Creds().put("ikea", {"host": host, "pin": pin, "token": obj["access_token"]})
     print(f"Paired with the DIRIGERA hub at {host}. Its certificate is pinned.")
@@ -3074,6 +3184,7 @@ def main(argv=None):
         sub.add_parser(name, help=text)
     sh = sub.add_parser("shots", help="write PNG renders to a folder (default /tmp)")
     sh.add_argument("folder", nargs="?", default="/tmp")
+    sh.add_argument("--live", action="store_true", help="render the real home from the paired hubs (not tado)")
     pr = sub.add_parser("pair", help="pair a hub")
     pr.add_argument("source", choices=SOURCES)
     pr.add_argument("--host", help="IP address of the hub, when discovery fails")
@@ -3085,7 +3196,7 @@ def main(argv=None):
     if THEME not in THEMES:
         sys.exit(f"Unknown theme {THEME!r}. Use one of: {', '.join(THEMES)}.")
     {"serve": serve, "demo": lambda: serve(True), "test": test, "status": status, None: serve,
-     "shots": lambda: shots(args.folder), "pair": lambda: PAIR[args.source](args.host),
+     "shots": lambda: (shots_live if args.live else shots)(args.folder), "pair": lambda: PAIR[args.source](args.host),
      "unpair": lambda: unpair(args.source)}[args.cmd]()
 
 

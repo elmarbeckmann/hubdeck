@@ -64,6 +64,11 @@ shows "No hub paired".
 Pairing needs you at the hub. Run these commands in a terminal. Each one finds the hub on the network
 by itself. When that fails, add `--host <ip address of the hub>`.
 
+**Local Network (macOS).** On the first run, macOS asks whether the program may find devices on the
+local network. Until you allow it, connections fail with "No route to host". Allow it in the dialog, or
+in System Settings › Privacy & Security › Local Network. Pairing waits and retries while the dialog is
+open. `PAIR_DEBUG=1 stream-deck-home pair ikea` prints what the hub answers (never the tokens).
+
 **Philips Hue Bridge**
 
 ```sh
@@ -72,7 +77,7 @@ stream-deck-home pair hue
 
 1. The command finds the bridge (mDNS `_hue._tcp`, then `discovery.meethue.com`).
 2. It prints "Press the round link button on the Hue Bridge now". Press the button on top of the bridge.
-3. The command asks the bridge every 2 s for up to 60 s. It saves the application key, the bridge id
+3. The command asks the bridge every 2 s for up to 3 minutes. It saves the application key, the bridge id
    and the fingerprint of the bridge certificate.
 
 **IKEA DIRIGERA**
@@ -83,7 +88,7 @@ stream-deck-home pair ikea
 
 1. The command finds the hub (mDNS `_ihsp._tcp`) and asks for a pairing code (OAuth with PKCE).
 2. It prints "Press the action button on the DIRIGERA hub now". Press the button on the bottom of the hub.
-3. The command asks the hub every 2 s for up to 60 s. It saves the access token and the fingerprint of
+3. The command asks the hub every 2 s for up to 3 minutes. It saves the access token and the fingerprint of
    the hub certificate.
 
 **tado**
@@ -257,6 +262,10 @@ keys while held) are collected and only the latest value is sent.
 
 - **A hub is not found.** The Mac and the hub must be on the same network and subnet. Check with
   `dns-sd -B _hue._tcp` (Hue) or `dns-sd -B _ihsp._tcp` (DIRIGERA). Use `--host <ip>` as a workaround.
+- **"No route to host" although the hub is on the network.** macOS blocks programs from the local network
+  until you allow it. Open System Settings › Privacy & Security › Local Network and switch on your
+  terminal (or the program that runs `deck.py`). Run `PAIR_DEBUG=1 stream-deck-home pair ikea` to see
+  the answers of the hub during pairing.
 - **"the certificate of the hub changed (hub reset?): pair it again".** The hub has a new certificate,
   for example after a factory reset, or somebody is between your Mac and the hub. Check the hub, then
   run `stream-deck-home unpair <hub>` and `stream-deck-home pair <hub>`.
@@ -280,6 +289,9 @@ keys while held) are collected and only the latest value is sent.
   back to requests, room merging, event handling, the credentials file mode, the coalescing of writes
   and the rendering of every page in every theme.
 - `uv run deck.py shots [folder]` writes PNG renders to `/tmp/homedeck-*.png`.
+- `uv run deck.py shots --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose rotating
+  token would break a running deck), waits up to 20 s for the first snapshot and writes the home, every
+  room, the scenes and the status page to `/tmp/homedeck-live-<page>.png`.
 
 API names that the code follows from the public descriptions and that no real hub has confirmed are
 marked in the code (DIRIGERA leak sensor, purifier fan mode, blinds direction).
