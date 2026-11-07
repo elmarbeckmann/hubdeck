@@ -3,7 +3,7 @@
 # requires-python = ">=3.12,<3.14"
 # dependencies = ["streamdeck>=0.9.6", "pillow>=10.1", "websocket-client>=1.7"]
 # ///
-"""Stream Deck control deck for the smart home.
+"""hubdeck: a Stream Deck control deck for the smart home.
 
 It talks to the hubs directly: Philips Hue Bridge (CLIP v2), IKEA DIRIGERA (local API) and tado
 (cloud). A source adapter per hub translates it into one internal model (home, rooms, accessories,
@@ -14,15 +14,15 @@ Home page: home, scenes, status, automations, all lights off, rooms. Room page: 
 press does the main action, a long press (0.5 s) opens the detail page. Locks, garage doors and the
 security system need a 1 s hold. Writes show at once and revert (key flashes red) when they fail.
 
-  uv run deck.py pair hue|ikea|tado [--host IP]   # one-time pairing, asks for a button press
-  uv run deck.py status                           # paired hubs, reachability, counts
-  uv run deck.py unpair hue|ikea|tado             # forget the credentials of a hub
-  uv run deck.py names                            # rooms, devices, scenes with source, id, current name (names.json)
-  uv run deck.py serve   # owns the Stream Deck (Elgato app must be closed)
-  uv run deck.py demo    # same deck against a fake home, no hub needed
-  uv run deck.py test    # self-check, no hardware and no network needed
-  uv run deck.py shots [folder]   # write PNG renders of some pages (default: a new private folder, printed)
-  uv run deck.py shots --live     # the same for the real home (paired hubs, not tado)
+  uv run hubdeck.py pair hue|ikea|tado [--host IP]   # one-time pairing, asks for a button press
+  uv run hubdeck.py status                           # paired hubs, reachability, counts
+  uv run hubdeck.py unpair hue|ikea|tado             # forget the credentials of a hub
+  uv run hubdeck.py names                            # rooms, devices, scenes with source, id, current name (names.json)
+  uv run hubdeck.py serve   # owns the Stream Deck (Elgato app must be closed)
+  uv run hubdeck.py demo    # same deck against a fake home, no hub needed
+  uv run hubdeck.py test    # self-check, no hardware and no network needed
+  uv run hubdeck.py shots [folder]   # write PNG renders of some pages (default: a new private folder, printed)
+  uv run hubdeck.py shots --live     # the same for the real home (paired hubs, not tado)
 """
 import argparse
 import base64
@@ -51,7 +51,8 @@ import time
 import urllib.parse
 from collections import namedtuple
 
-CRED_DIR = os.path.expanduser("~/.config/stream-deck-home")
+CRED_DIR = os.path.expanduser("~/.config/hubdeck")
+OLD_CRED_DIR = os.path.expanduser("~/.config/stream-deck-home")  # name before the rename: moved by migrate_config()
 CRED_FILE = os.path.join(CRED_DIR, "credentials.json")
 NAMES_FILE = os.path.join(CRED_DIR, "names.json")  # optional: name aliases and hidden items. No secrets in it.
 DEFAULT_HIDE = ["dirigera_integration_*"]  # hidden when names.json does not exist: automatic DIRIGERA integration scenes
@@ -122,7 +123,7 @@ MODES = [("Off", None), ("Heat", 1), ("Cool", 2), ("Auto", 0)]  # name, HeaterCo
 Key = namedtuple("Key", "label glyph fill bar badge low sub hint ident tap hold long repeat sel cat on rgb note",
                  defaults=("", None, DARK, None, "", False, "", "", "", None, None, None, False, False, "", False, None, ""))
 # note: a second small line under the label (the room name, when two keys show the same name)
-THEME = "graphite"  # key look: graphite, vivid or neon. Change with --theme or STREAM_DECK_HOME_THEME (docs/themes.html)
+THEME = "graphite"  # key look: graphite, vivid or neon. Change with --theme or HUBDECK_THEME (docs/themes.html)
 THEMES = ("graphite", "vivid", "neon")
 DEVICE_RGB = {"outlet": (52, 199, 89), "switch": (52, 199, 89), "fan": (90, 200, 250), "purifier": (90, 200, 250),
               "valve": (90, 200, 250), "cover": (90, 200, 250), "garage": (255, 159, 10)}  # devices without a light color
@@ -1151,13 +1152,23 @@ def log(msg):
     print(msg, flush=True)
 
 
+def migrate_config(new=CRED_DIR, old=OLD_CRED_DIR):
+    """Move the config folder of the old name to the new name. Rename is atomic and keeps the modes.
+    When the new folder exists, it wins and the old one stays. Returns True after a move."""
+    if os.path.lexists(new) or not os.path.isdir(old):
+        return False
+    os.rename(old, new)
+    log("moved ~/.config/stream-deck-home to ~/.config/hubdeck")
+    return True
+
+
 def describe(error):
     """Short text of an exception for logs. Our own messages never contain tokens."""
     return f"{type(error).__name__}: {error}"
 
 
 class Creds:
-    """~/.config/stream-deck-home/credentials.json: mode 0600 in a folder with mode 0700.
+    """~/.config/hubdeck/credentials.json: mode 0600 in a folder with mode 0700.
     These tokens control the house (locks too). They are never printed or logged."""
 
     def __init__(self, path=CRED_FILE):
@@ -2570,7 +2581,7 @@ def serve(demo=False):
     else:
         link = paired_hub(events)
         if not link.sources:
-            log("No hub is paired. Run: stream-deck-home pair hue|ikea|tado")
+            log("No hub is paired. Run: hubdeck pair hue|ikea|tado")
     link.start()
     waiting_printed = False
     try:
@@ -2993,38 +3004,38 @@ def test_hardening():
 
 def test_names():
     lamp = lambda id, name, room, reach=True: hacc(id, name, room, [hsvc(id + ":l", name, "43", [hchar(ON, False)])], reach)
-    sensor = hacc("hue:s", "Hall sensor", "Woonkamer", [hsvc("hue:s:t", "Hall sensor temperature", "8A", [hchar(CURT, 20.0, "float", w=False)])])
+    sensor = hacc("hue:s", "Hall sensor", "Lounge", [hsvc("hue:s:t", "Hall sensor temperature", "8A", [hchar(CURT, 20.0, "float", w=False)])])
     scene = lambda id, name, room="": {"id": id, "name": name, "kind": "custom", "room": room}
-    parts = [("hue", True, {"rooms": ["Woonkamer"], "accessories": [lamp("hue:1", "Hanglamp", "Woonkamer"), sensor],
-                            "scenes": [scene("hue:a", "Relax", "Woonkamer"), scene("hue:b", "Relax", "Garage")], "triggers": []}),
-             ("ikea", True, {"rooms": ["Woonkamer", "Garage"], "triggers": [],
-                             "accessories": [lamp("ikea:a", "Bureau", "Garage", False), lamp("ikea:b", "Bureau", "Woonkamer", False)],
-                             "scenes": [scene("ikea:s1", "dirigera_integration_x"), scene("ikea:s2", "Avond")]})]
+    parts = [("hue", True, {"rooms": ["Lounge"], "accessories": [lamp("hue:1", "Pendant", "Lounge"), sensor],
+                            "scenes": [scene("hue:a", "Relax", "Lounge"), scene("hue:b", "Relax", "Garage")], "triggers": []}),
+             ("ikea", True, {"rooms": ["Lounge", "Garage"], "triggers": [],
+                             "accessories": [lamp("ikea:a", "Desk", "Garage", False), lamp("ikea:b", "Desk", "Lounge", False)],
+                             "scenes": [scene("ikea:s1", "dirigera_integration_x"), scene("ikea:s2", "Dinner")]})]
     has = lambda home: {a["id"]: a["name"] for a in home["accessories"]}
     # no aliases, no hide: everything stays, rooms merge by name
     home = merge(parts)
-    assert [r["name"] for r in home["rooms"]] == ["Woonkamer", "Garage"] and len(home["scenes"]) == 4 and len(home["accessories"]) == 4
+    assert [r["name"] for r in home["rooms"]] == ["Lounge", "Garage"] and len(home["scenes"]) == 4 and len(home["accessories"]) == 4
     # aliases: by hub name, by prefixed id (two devices share a name), rooms before the merge, scenes; services follow the device
     n = Names(None)
-    n.load({"devices": {"Hanglamp": "Kitchen pendant", "ikea:b": "Desk", "Hall sensor": "Hallway sensor"},
-            "rooms": {"Woonkamer": "Living room"}, "scenes": {"Avond": "Evening", "hue:b": "Relax 2"}, "hide": ["dirigera_integration_*"]})
+    n.load({"devices": {"Pendant": "Kitchen pendant", "ikea:b": "Work desk", "Hall sensor": "Hallway sensor"},
+            "rooms": {"Lounge": "Living room"}, "scenes": {"Dinner": "Supper", "hue:b": "Relax 2"}, "hide": ["dirigera_integration_*"]})
     home = merge(parts, n)
-    assert has(home) == {"hue:1": "Kitchen pendant", "hue:s": "Hallway sensor", "ikea:a": "Bureau", "ikea:b": "Desk"}, has(home)
+    assert has(home) == {"hue:1": "Kitchen pendant", "hue:s": "Hallway sensor", "ikea:a": "Desk", "ikea:b": "Work desk"}, has(home)
     assert next(a for a in home["accessories"] if a["id"] == "hue:s")["services"][0]["name"] == "Hallway sensor temperature"
     assert [r["name"] for r in home["rooms"]] == ["Living room", "Garage"], home["rooms"]
-    assert [(s["name"], s["room"]) for s in home["scenes"]] == [("Relax", "Living room"), ("Relax 2", "Garage"), ("Evening", "")]
+    assert [(s["name"], s["room"]) for s in home["scenes"]] == [("Relax", "Living room"), ("Relax 2", "Garage"), ("Supper", "")]
     # hide: globs on the hub name or the alias, for devices, scenes and rooms (a hidden room hides its devices)
-    n.load({"hide": ["Bu*", "dirigera_*", "kitchen*"], "devices": {"Hanglamp": "Kitchen pendant"}})
+    n.load({"hide": ["De*", "dirigera_*", "kitchen*"], "devices": {"Pendant": "Kitchen pendant"}})
     home = merge(parts, n)
-    assert has(home) == {"hue:s": "Hall sensor"} and [s["name"] for s in home["scenes"]] == ["Relax", "Relax", "Avond"], has(home)
+    assert has(home) == {"hue:s": "Hall sensor"} and [s["name"] for s in home["scenes"]] == ["Relax", "Relax", "Dinner"], has(home)
     n.load({"hide": ["garage"]})
     home = merge(parts, n)
-    assert [r["name"] for r in home["rooms"]] == ["Woonkamer"] and set(has(home)) == {"hue:1", "hue:s", "ikea:b"}
-    assert [(s["id"], s["room"]) for s in home["scenes"]] == [("hue:a", "Woonkamer"), ("ikea:s1", ""), ("ikea:s2", "")]  # the Garage scene is dropped
+    assert [r["name"] for r in home["rooms"]] == ["Lounge"] and set(has(home)) == {"hue:1", "hue:s", "ikea:b"}
+    assert [(s["id"], s["room"]) for s in home["scenes"]] == [("hue:a", "Lounge"), ("ikea:s1", ""), ("ikea:s2", "")]  # the Garage scene is dropped
     # lookups ignore case and outer spaces; null and empty aliases are off; an alias for "Other" applies
-    n.load({"devices": {" HANGLAMP ": " Pendant ", "ikea:a": None, "ikea:b": "  "}, "rooms": {"woonkamer ": "Salon", "other": "Misc"}})
-    assert n.device("hue:1", "hanglamp ") == "Pendant" and n.device("ikea:a", "Bureau") == "Bureau" and n.device("ikea:b", "Bureau") == "Bureau"
-    assert n.room(" WOONKAMER") == "Salon" and n.room("Garage ") == "Garage"
+    n.load({"devices": {" PENDANT ": " Hanging lamp ", "ikea:a": None, "ikea:b": "  "}, "rooms": {"lounge ": "Salon", "other": "Misc"}})
+    assert n.device("hue:1", "pendant ") == "Hanging lamp" and n.device("ikea:a", "Desk") == "Desk" and n.device("ikea:b", "Desk") == "Desk"
+    assert n.room(" LOUNGE") == "Salon" and n.room("Garage ") == "Garage"
     home = merge([("hue", True, {"rooms": [], "accessories": [lamp("hue:9", "Lamp", "")], "scenes": [], "triggers": []})], n)
     assert [r["name"] for r in home["rooms"]] == ["Misc"]
     # the default hide list applies without a file only; a file without "hide" hides nothing
@@ -3033,14 +3044,14 @@ def test_names():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "names.json")
         with open(path, "w") as f:
-            json.dump({"devices": {"Hanglamp": "A"}}, f)
+            json.dump({"devices": {"Pendant": "A"}}, f)
         n = Names(path)
-        assert n.device("hue:1", "Hanglamp") == "A" and not n.hidden("dirigera_integration_x") and n.check() is False
-        for text, alias, changed in (('{"devices": {"Hanglamp": "B"}}', "B", True), ("{broken", "B", False), ('[1]', "B", False)):
+        assert n.device("hue:1", "Pendant") == "A" and not n.hidden("dirigera_integration_x") and n.check() is False
+        for text, alias, changed in (('{"devices": {"Pendant": "B"}}', "B", True), ("{broken", "B", False), ('[1]', "B", False)):
             with open(path, "w") as f:
                 f.write(text)
             os.utime(path, ns=(n.stamp + 10**9, n.stamp + 10**9))
-            assert n.check() is changed and n.device("hue:1", "Hanglamp") == alias, text
+            assert n.check() is changed and n.device("hue:1", "Pendant") == alias, text
         # the hub picks the edit up on its next update, without a restart
         events = queue.Queue()
         src = Hue({"host": "h", "pin": "p", "key": "k"}, None)
@@ -3050,7 +3061,7 @@ def test_names():
         hub.update()
         drain(events)
         with open(path, "w") as f:
-            json.dump({"devices": {"Hanglamp": "C", "Floor lamp": "Standing lamp"}}, f)
+            json.dump({"devices": {"Pendant": "C", "Floor lamp": "Standing lamp"}}, f)
         os.utime(path, ns=(n.stamp + 10**9, n.stamp + 10**9))
         hub.update()
         assert "Standing lamp" in has(next(m[1] for m in drain(events) if m[0] == "msg" and m[1]["type"] == "snapshot")["homes"][0]).values()
@@ -3058,16 +3069,16 @@ def test_names():
     ui = UI(Stub(), 0.0)
     ui.on_msg({"type": "snapshot", "homes": [merge(parts, Names(None))]}, 0.0)
     ui.stack = [("home", 0), ("scenes", 0)]
-    assert [(k.label, k.note) for k in ui.keys(0)[1:7]] == [("Relax", "Woonkamer"), ("Relax", "Garage"), ("dirigera_integration_x", ""), ("Avond", ""),
+    assert [(k.label, k.note) for k in ui.keys(0)[1:7]] == [("Relax", "Lounge"), ("Relax", "Garage"), ("dirigera_integration_x", ""), ("Dinner", ""),
                                                              ("", ""), ("", "")]
     ui.stack = [("home", 0), ("status", 0)]
-    assert [(k.label, k.note) for k in ui.keys(0) if k.badge == "!"] == [("Bureau", "Garage"), ("Bureau", "Woonkamer")]
+    assert [(k.label, k.note) for k in ui.keys(0) if k.badge == "!"] == [("Desk", "Garage"), ("Desk", "Lounge")]
     # the label fits: a long word shrinks to 9 px before it ends with an ellipsis, and it never breaks mid-word
     f, rows = fit("Koffieapparaat", 11)
     assert rows == ["Koffieapparaat"] and f.size < 11 and f.getlength(rows[0]) <= 68
     f, rows = fit("Koffieapparaatmetheleveelletters", 11)
     assert f.size == 9 and len(rows) == 1 and rows[0].endswith("…") and f.getlength(rows[0]) <= 68
-    assert fit("Spot keukenrek", 11)[1] == ["Spot", "keukenrek"] and fit("Spot keukenrek", 11)[0].size == 11
+    assert fit("Spot cupboard", 11)[1] == ["Spot", "cupboard"] and fit("Spot cupboard", 11)[0].size == 11
     # structure events: renames, room changes, members
     hue = Hue({"host": "h", "pin": "p", "key": "k"}, None)
     hue.load(hue_sample())
@@ -3109,6 +3120,17 @@ def test():
     test_hubs()
     test_hardening()
     test_names()
+    with tempfile.TemporaryDirectory() as tmp:  # config folder migration
+        new, old = os.path.join(tmp, "hubdeck"), os.path.join(tmp, "stream-deck-home")
+        assert migrate_config(new, old) is False and not os.path.exists(new)  # nothing to move
+        os.mkdir(old, 0o700)
+        with open(os.path.join(old, "credentials.json"), "w") as f:
+            f.write("{}")
+        os.chmod(os.path.join(old, "credentials.json"), 0o600)
+        assert migrate_config(new, old) is True and not os.path.exists(old)
+        assert os.stat(new).st_mode & 0o777 == 0o700 and os.stat(os.path.join(new, "credentials.json")).st_mode & 0o777 == 0o600
+        os.mkdir(old)  # both exist: the new folder wins, the old one stays
+        assert migrate_config(new, old) is False and os.path.isdir(old) and os.path.isfile(os.path.join(new, "credentials.json"))
     # UUIDs
     assert short("0000004A-0000-1000-8000-0026BB765291") == "4A" and short("0000000E-0000-1000-8000-0026BB765291") == "E"
     assert short("ABCD1234-0000-0000-0000-000000000000") == "ABCD1234-0000-0000-0000-000000000000"
@@ -3392,7 +3414,7 @@ def test():
 
 def private_dir():
     """New folder for renders, mode 0700 (the home layout is private). Its path is printed."""
-    out = tempfile.mkdtemp(prefix="homedeck-")
+    out = tempfile.mkdtemp(prefix="hubdeck-")
     print(f"Writing to {out}")
     return out
 
@@ -3405,12 +3427,12 @@ def shots(out=None):
                        ("status", ("status", 0)), ("hall", ("room", "hall", 0))):
         ui.stack = [("home", 0), page] if name != "home" else [page]
         keys = ui.keys(0)
-        sheet(keys).save(f"{out}/homedeck-{name}.png")  # the selected theme
-        print(f"{out}/homedeck-{name}.png")
+        sheet(keys).save(f"{out}/hubdeck-{name}.png")  # the selected theme
+        print(f"{out}/hubdeck-{name}.png")
         if name in ("home", "room"):
             for theme in THEMES:
-                sheet(keys, theme=theme).save(f"{out}/homedeck-{theme}-{name}.png")
-                print(f"{out}/homedeck-{theme}-{name}.png")
+                sheet(keys, theme=theme).save(f"{out}/hubdeck-{theme}-{name}.png")
+                print(f"{out}/hubdeck-{theme}-{name}.png")
 
 
 def shots_live(out=None):
@@ -3437,7 +3459,7 @@ def shots_live(out=None):
             ui.stack = [("home", 0), page[:-1] + (n,)] if page[0] != "home" else [page]
             keys = ui.keys(0)
             count = keys[14].tap[1] - 1 if keys[14].tap and keys[14].tap[0] == "flip" else 0
-            path = f"{out}/homedeck-live-{name}{'' if n == 0 else f'-{n + 1}'}.png"
+            path = f"{out}/hubdeck-live-{name}{'' if n == 0 else f'-{n + 1}'}.png"
             sheet(keys).save(path)
             print(path)
             n += 1
@@ -3488,7 +3510,7 @@ def pair_hue(host=None):
         pin = conn.pin
         try:
             st, obj, _ = request(conn, "POST", "/api", body={
-                "devicetype": f"stream-deck-home#{hostname()[:19]}", "generateclientkey": True})
+                "devicetype": f"hubdeck#{hostname()[:19]}", "generateclientkey": True})
         finally:
             conn.close()
         item = obj[0] if isinstance(obj, list) and obj and isinstance(obj[0], dict) else {}
@@ -3637,8 +3659,8 @@ def unpair(name):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="stream-deck-home", description="Stream Deck control deck for Hue, DIRIGERA and tado.")
-    p.add_argument("--theme", choices=THEMES, help="key look (default graphite, or STREAM_DECK_HOME_THEME)")
+    p = argparse.ArgumentParser(prog="hubdeck", description="hubdeck: a Stream Deck control deck for Hue, DIRIGERA and tado.")
+    p.add_argument("--theme", choices=THEMES, help="key look (default graphite, or HUBDECK_THEME)")
     sub = p.add_subparsers(dest="cmd")
     for name, text in (("serve", "run the deck (default)"), ("demo", "run the deck on a fake home"),
                        ("test", "self-check without hardware"), ("status", "paired hubs and counts"),
@@ -3654,9 +3676,11 @@ def main(argv=None):
     up.add_argument("source", choices=SOURCES)
     args = p.parse_args(argv)
     global THEME
-    THEME = args.theme or os.environ.get("STREAM_DECK_HOME_THEME") or THEME
+    THEME = args.theme or os.environ.get("HUBDECK_THEME") or THEME
     if THEME not in THEMES:
         sys.exit(f"Unknown theme {THEME!r}. Use one of: {', '.join(THEMES)}.")
+    if args.cmd != "test":  # the self-check must not touch the real config
+        migrate_config()
     {"serve": serve, "demo": lambda: serve(True), "test": test, "status": status, "names": names_cmd, None: serve,
      "shots": lambda: (shots_live if args.live else shots)(args.folder), "pair": lambda: PAIR[args.source](args.host),
      "unpair": lambda: unpair(args.source)}[args.cmd]()

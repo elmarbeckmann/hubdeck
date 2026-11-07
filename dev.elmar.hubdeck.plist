@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>dev.elmar.stream-deck-home</string>
+    <string>dev.elmar.hubdeck</string>
     <key>ProgramArguments</key>
     <array>
         <string>__BIN__</string>

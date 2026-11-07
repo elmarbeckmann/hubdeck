@@ -1,4 +1,4 @@
-# Stream Deck smart home control deck
+# hubdeck
 
 A tryout built with Claude on 2026-11-07. It controls your smart home from an original 15-key
 Stream Deck: lights, outlets, fans, thermostats, blinds, locks, the security system, scenes and
@@ -17,7 +17,7 @@ The devices can stay in Apple Home. Pairing adds one access key on each Hue and 
 changes nothing else on the hubs.
 
 ```
-Stream Deck <--USB--> deck.py --+--HTTPS + SSE-->        Hue Bridge
+Stream Deck <--USB--> hubdeck.py --+--HTTPS + SSE-->        Hue Bridge
                                 +--HTTPS + WebSocket-->  DIRIGERA
                                 +--HTTPS, cloud-->       tado
 ```
@@ -37,43 +37,47 @@ Stream Deck <--USB--> deck.py --+--HTTPS + SSE-->        Hue Bridge
 Planned, with the tap pattern of `~/Code/tinker-lab/homebrew-tap` (not published yet):
 
 ```sh
-brew install elmarbeckmann/tap/stream-deck-home
-brew services start stream-deck-home
+brew install elmarbeckmann/tap/hubdeck
+brew services start hubdeck
 ```
 
-The formula will copy `deck.py` to `libexec` and write a `stream-deck-home` command that runs
+The formula will copy `hubdeck.py` to `libexec` and write a `hubdeck` command that runs
 `uv run --script`, like `stream-deck-eq`.
 
 From source:
 
 ```sh
-git clone https://github.com/elmarbeckmann/stream-deck-home
-cd stream-deck-home
+git clone https://github.com/elmarbeckmann/hubdeck
+cd hubdeck
 make install
 ```
 
 `make install` does these steps:
 
-1. It copies `deck.py` and `deck.py.lock` to `~/.local/share/stream-deck-home/`.
-2. It writes the command `~/.local/bin/stream-deck-home`. The command runs `uv run --script` on the
-   installed `deck.py`.
-3. It writes the launch agent `~/Library/LaunchAgents/dev.elmar.stream-deck-home.plist` and starts it.
+1. It copies `hubdeck.py` and `hubdeck.py.lock` to `~/.local/share/hubdeck/`.
+2. It writes the command `~/.local/bin/hubdeck`. The command runs `uv run --script` on the
+   installed `hubdeck.py`.
+3. It writes the launch agent `~/Library/LaunchAgents/dev.elmar.hubdeck.plist` and starts it.
 
-The launch agent `dev.elmar.stream-deck-home` runs `stream-deck-home serve`. It starts at login and
-restarts after a crash. It writes to the log `~/Library/Logs/stream-deck-home.log`. To use another
+The launch agent `dev.elmar.hubdeck` runs `hubdeck serve`. It starts at login and
+restarts after a crash. It writes to the log `~/Library/Logs/hubdeck.log`. To use another
 prefix than `~/.local`, run `make install PREFIX=<folder>`. Run `make install` again after you change
-`deck.py`. Without installation, use `uv run deck.py <command>` in the project folder.
+`hubdeck.py`. Without installation, use `uv run hubdeck.py <command>` in the project folder.
 
-**Lock file.** `deck.py.lock` pins the exact versions of the dependencies (`pillow`, `streamdeck`,
+`make install` and `brew services` are alternatives. Use one of them, not both.
+
+The config folder was `~/.config/stream-deck-home` before the rename. The first command moves it to `~/.config/hubdeck` when the new folder does not exist yet.
+
+**Lock file.** `hubdeck.py.lock` pins the exact versions of the dependencies (`pillow`, `streamdeck`,
 `websocket-client`). `uv run` uses the lock file that stands next to the script. To update the pinned
 versions, run:
 
 ```sh
-uv lock --script deck.py --upgrade
+uv lock --script hubdeck.py --upgrade
 ```
 
-To check the lock file without a change, run `uv lock --script deck.py --check`. After you change the
-dependency list at the top of `deck.py`, run `uv lock --script deck.py`. Then run `make install` again.
+To check the lock file without a change, run `uv lock --script hubdeck.py --check`. After you change the
+dependency list at the top of `hubdeck.py`, run `uv lock --script hubdeck.py`. Then run `make install` again.
 
 Before the service shows anything, pair at least one hub (next section). Without a paired hub, key 0
 shows "No hub paired".
@@ -84,18 +88,18 @@ Pairing needs you at the hub. Run these commands in a terminal. Each one finds t
 by itself. When that fails, add `--host <ip address of the hub>`.
 
 **Use `--host`.** The pairing does not verify the identity of the hub. A device on your network can
-answer the discovery and receive the pairing. Run `stream-deck-home pair hue --host <ip>` or
-`stream-deck-home pair ikea --host <ip>` with the address that you know (see "Security").
+answer the discovery and receive the pairing. Run `hubdeck pair hue --host <ip>` or
+`hubdeck pair ikea --host <ip>` with the address that you know (see "Security").
 
 **Local Network (macOS).** On the first run, macOS asks whether the program may find devices on the
 local network. Until you allow it, connections fail with "No route to host". Allow it in the dialog, or
 in System Settings › Privacy & Security › Local Network. Pairing waits and retries while the dialog is
-open. `PAIR_DEBUG=1 stream-deck-home pair ikea` prints what the hub answers (never the tokens).
+open. `PAIR_DEBUG=1 hubdeck pair ikea` prints what the hub answers (never the tokens).
 
 **Philips Hue Bridge**
 
 ```sh
-stream-deck-home pair hue
+hubdeck pair hue
 ```
 
 1. Without `--host`, the command finds the bridge (mDNS `_hue._tcp`, then `discovery.meethue.com`).
@@ -109,7 +113,7 @@ stream-deck-home pair hue
 **IKEA DIRIGERA**
 
 ```sh
-stream-deck-home pair ikea
+hubdeck pair ikea
 ```
 
 1. Without `--host`, the command finds the hub (mDNS `_ihsp._tcp`). It asks the hub for a pairing code
@@ -122,7 +126,7 @@ stream-deck-home pair ikea
 **tado**
 
 ```sh
-stream-deck-home pair tado
+hubdeck pair tado
 ```
 
 1. The command prints a web address and a code. It opens the address in your browser when the address
@@ -135,16 +139,16 @@ stream-deck-home pair tado
 
 **Other commands**
 
-- `stream-deck-home status` prints one line for each hub. For Hue and DIRIGERA it shows whether the hub
+- `hubdeck status` prints one line for each hub. For Hue and DIRIGERA it shows whether the hub
   answers and how many rooms, devices and scenes it has. For tado it prints only that tado is paired. It
   does not contact tado, because a token refresh would rotate the refresh token under a running deck.
   It does not print tokens.
-- `stream-deck-home names` lists every room, device and scene of Hue and DIRIGERA (see "Names"). It does
+- `hubdeck names` lists every room, device and scene of Hue and DIRIGERA (see "Names"). It does
   not contact tado. It does not print tokens.
-- `stream-deck-home unpair hue|ikea|tado` deletes the local credentials of one hub from this Mac. It does
+- `hubdeck unpair hue|ikea|tado` deletes the local credentials of one hub from this Mac. It does
   not revoke the access key. The key stays valid on the hub until you remove it there (Hue: developer
   page of the bridge or the Hue app; DIRIGERA: IKEA Home smart app; tado: your tado account).
-- `stream-deck-home --help` lists all commands. `serve` is the default command.
+- `hubdeck --help` lists all commands. `serve` is the default command.
 
 ## Layout
 
@@ -232,10 +236,10 @@ Open it in a browser.
 | `vivid` | Saturated two-tone tiles. Each room keeps its own hue. |
 | `neon` | Near-black keys with a colored ring. |
 
-Choose one with the constant `THEME` at the top of `deck.py`, with `--theme graphite|vivid|neon`
-before the command (`stream-deck-home --theme neon serve`), or with the environment variable
-`STREAM_DECK_HOME_THEME`. The option wins over the variable, and the variable wins over the constant.
-`uv run deck.py shots` renders sample pages of the demo home (see "Development").
+Choose one with the constant `THEME` at the top of `hubdeck.py`, with `--theme graphite|vivid|neon`
+before the command (`hubdeck --theme neon serve`), or with the environment variable
+`HUBDECK_THEME`. The option wins over the variable, and the variable wins over the constant.
+`uv run hubdeck.py shots` renders sample pages of the demo home (see "Development").
 
 ## Names
 
@@ -250,25 +254,25 @@ before the command (`stream-deck-home --theme neon serve`), or with the environm
 The names do not come from Apple Home. Apple keeps its own names in iCloud. A rename in Apple Home does
 not reach the hubs, so it does not show on the deck.
 
-**How rooms merge.** Rooms with the same name (any case) from different hubs are one room. "Woonkamer" in
-Hue and "woonkamer" in DIRIGERA are one key on the deck. A room alias (see below) applies before the
+**How rooms merge.** Rooms with the same name (any case) from different hubs are one room. "Lounge" in
+Hue and "lounge" in DIRIGERA are one key on the deck. A room alias (see below) applies before the
 rooms merge. Two rooms that you give the same alias become one room.
 
 **Change a name.** There are two ways:
 
 1. Rename the item in the brand app. The new name shows on the deck within seconds (see "New, removed
    and renamed devices").
-2. Use the optional file `~/.config/stream-deck-home/names.json`. It is a plain user file with no
+2. Use the optional file `~/.config/hubdeck/names.json`. It is a plain user file with no
    secrets. The deck reads it again when its modification time changes, so an edit shows within about
    2 seconds (`NAMES_POLL`). A restart is not necessary. A broken file is logged and the last good names
   stay. When the file is broken at start-up, the deck uses no aliases and hides nothing.
 
 ```json
 {
-  "devices": {"Hanglamp": "Kitchen pendant", "ikea:3c5f0a1e-0000-0000-0000-000000000000": "Desk (garage)"},
-  "rooms": {"Woonkamer": "Living room"},
-  "scenes": {"Ontladen": "Unload"},
-  "hide": ["dirigera_integration_*", "Spot vloer *"]
+  "devices": {"Pendant": "Kitchen pendant", "ikea:3c5f0a1e-0000-0000-0000-000000000000": "Desk (garage)"},
+  "rooms": {"Lounge": "Living room"},
+  "scenes": {"Dinner": "Supper"},
+  "hide": ["dirigera_integration_*", "Floor spot *"]
 }
 ```
 
@@ -280,7 +284,7 @@ rooms merge. Two rooms that you give the same alias become one room.
   sensor temperature").
 - A device without a room belongs to the room "Other". Use `"Other"` under `rooms` to rename
   that room, or in `hide` to hide it.
-- Run `stream-deck-home names` to see every room, device and scene of Hue and DIRIGERA. The first line
+- Run `hubdeck names` to see every room, device and scene of Hue and DIRIGERA. The first line
   shows the path of names.json and whether the file exists. Each other line shows the kind, the source,
   the id and the hub name. A line has `-> alias` when names.json renames it, and `(hidden)` when it
   hides it. Rooms have the id `-`. Copy the name or the id from this list.
@@ -322,7 +326,7 @@ Pair again only after a hub reset or when you get a new hub.
 
 tado limits the requests of accounts without the paid subscription to about 100 per day. So:
 
-- The deck asks tado every 15 minutes (`TADO_POLL` in `deck.py`, 96 requests per day with one zone
+- The deck asks tado every 15 minutes (`TADO_POLL` in `hubdeck.py`, 96 requests per day with one zone
   request each). Make the value larger when your account has more zones or you use the tado app a lot.
 - It asks once more after each write. Target presses within 3 s (`TADO_COALESCE`) become one request.
 - After HTTP 429 the deck sends nothing to tado for the time of the `Retry-After` header (one hour
@@ -340,7 +344,7 @@ overlay that stays until you change it.
 
 ## Security
 
-The access keys control your house. Treat `~/.config/stream-deck-home/credentials.json` like a
+The access keys control your house. Treat `~/.config/hubdeck/credentials.json` like a
 password:
 
 - The folder has mode 0700 and the file has mode 0600. The deck fixes a wider mode when it reads the
@@ -366,7 +370,7 @@ password:
 
 ## Settings
 
-Constants at the top of `deck.py`. Change one, then run `make install` again.
+Constants at the top of `hubdeck.py`. Change one, then run `make install` again.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
@@ -402,22 +406,22 @@ keys while held) are collected and only the latest value is sent.
   `dns-sd -B _hue._tcp` (Hue) or `dns-sd -B _ihsp._tcp` (DIRIGERA). Use `--host <ip>` as a workaround.
 - **"No route to host" although the hub is on the network.** macOS blocks programs from the local network
   until you allow it. Open System Settings › Privacy & Security › Local Network and switch on your
-  terminal (or the program that runs `deck.py`). Run `PAIR_DEBUG=1 stream-deck-home pair ikea` to see
+  terminal (or the program that runs `hubdeck.py`). Run `PAIR_DEBUG=1 hubdeck pair ikea` to see
   the answers of the hub during pairing.
 - **"the certificate of the hub changed (hub reset?): pair it again".** The hub has a new certificate,
   for example after a factory reset, or somebody is between your Mac and the hub. Check the hub, then
-  run `stream-deck-home unpair <hub>` and `stream-deck-home pair <hub>`.
+  run `hubdeck unpair <hub>` and `hubdeck pair <hub>`.
 - **The deck stays black or "Waiting for a Stream Deck".** Another program owns the device. Quit the
   Elgato Stream Deck app and `stream-deck-t3` or `stream-deck-eq`. Check that `hidapi` is installed.
 - **Key 0 shows "Offline:" and a list.** No hub answers. The deck tries again after 2 s, 4 s and so on
-  up to 60 s. Run `stream-deck-home status`. Read the log `~/Library/Logs/stream-deck-home.log`.
+  up to 60 s. Run `hubdeck status`. Read the log `~/Library/Logs/hubdeck.log`.
 - **tado shows old values.** The deck polls every 15 minutes, and it waits after HTTP 429.
 - **tado: "tado refused the login ... pair tado again".** The refresh token is not valid any more. Run
-  `stream-deck-home unpair tado` and `stream-deck-home pair tado`.
+  `hubdeck unpair tado` and `hubdeck pair tado`.
 - **A hub shows old values and stays online.** The deck cannot read the new data of that hub. It keeps
   the last good data and logs the error. Read the log.
 - **Blinds open when you close them (DIRIGERA).** The direction of `blindsTargetLevel` is a guess
-  (0 = open). Change `IKEA_BLINDS_INVERTED` to `False` in `deck.py`.
+  (0 = open). Change `IKEA_BLINDS_INVERTED` to `False` in `hubdeck.py`.
 - **A DIRIGERA water sensor or air purifier does not work.** The attribute names (`waterLeakDetected`,
   `fanMode`) are not verified against a real device. Unknown attributes are ignored. Report what
   `GET /v1/devices` shows.
@@ -425,20 +429,20 @@ keys while held) are collected and only the latest value is sent.
 
 ## Development
 
-- `uv run deck.py demo` shows the same deck on a fake home (five rooms, a failing Desk lamp, a failing
+- `uv run hubdeck.py demo` shows the same deck on a fake home (five rooms, a failing Desk lamp, a failing
   Party scene) without a hub.
-- `uv run deck.py test` is the self-check. It needs no hardware and no network. It checks the color
+- `uv run hubdeck.py test` is the self-check. It needs no hardware and no network. It checks the color
   math, the translation of sample Hue, DIRIGERA and tado data into the model, the translation of writes
   back to requests, room merging, name aliases and hiding, structure events, the credentials file mode,
   the coalescing of writes, the fit of labels and the rendering of every page in every theme.
-- `uv run deck.py shots [folder]` renders pages of the demo home to `homedeck-<page>.png` (home, room,
+- `uv run hubdeck.py shots [folder]` renders pages of the demo home to `hubdeck-<page>.png` (home, room,
   light, lights2, thermostat, status, hall). It also writes the home page and a room page in every theme
-  to `homedeck-<theme>-home.png` and `homedeck-<theme>-room.png`. With a folder, the files go there.
+  to `hubdeck-<theme>-home.png` and `hubdeck-<theme>-room.png`. With a folder, the files go there.
   Without a folder, the command makes a new private folder (mode 0700) in the temp directory and
   prints its path. It prints the path of each file.
-- `uv run deck.py shots [folder] --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose
+- `uv run hubdeck.py shots [folder] --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose
   rotating token would break a running deck). It waits up to 20 s for the hubs. It writes the home,
-  every room, the scenes and the status page of your real home to `homedeck-live-<page>.png`. The
+  every room, the scenes and the status page of your real home to `hubdeck-live-<page>.png`. The
   folder rules are the same. The images show your room and device names. Keep them private.
 
 API names that the code follows from the public descriptions and that no real hub has confirmed are
@@ -447,29 +451,29 @@ marked in the code (DIRIGERA leak sensor, purifier fan mode, blinds direction).
 ## Uninstall
 
 ```sh
-stream-deck-home unpair hue
-stream-deck-home unpair ikea
-stream-deck-home unpair tado
+hubdeck unpair hue
+hubdeck unpair ikea
+hubdeck unpair tado
 make uninstall
 ```
 
-`make uninstall` stops the launch agent `dev.elmar.stream-deck-home` and removes its plist, the command
-`~/.local/bin/stream-deck-home` and the folder `~/.local/share/stream-deck-home`. It does not remove
-the credentials or the log. With Homebrew (not published yet): `brew services stop stream-deck-home`
-and `brew uninstall stream-deck-home`. Remove the folder `~/.config/stream-deck-home` when you do not
-need the credentials any more. Remove the log `~/Library/Logs/stream-deck-home.log` too. `unpair`
+`make uninstall` stops the launch agent `dev.elmar.hubdeck` and removes its plist, the command
+`~/.local/bin/hubdeck` and the folder `~/.local/share/hubdeck`. It does not remove
+the credentials or the log. With Homebrew (not published yet): `brew services stop hubdeck`
+and `brew uninstall hubdeck`. Remove the folder `~/.config/hubdeck` when you do not
+need the credentials any more. Remove the log `~/Library/Logs/hubdeck.log` too. `unpair`
 deletes only the local token, so remove the access keys on the hubs too (see "Other commands").
 
 ## Files
 
-- `deck.py`: the whole program, with the source adapters and the commands `serve`, `demo`, `test`,
+- `hubdeck.py`: the whole program, with the source adapters and the commands `serve`, `demo`, `test`,
   `shots`, `pair`, `status`, `names` and `unpair`.
-- `deck.py.lock`: the pinned versions of the dependencies.
+- `hubdeck.py.lock`: the pinned versions of the dependencies.
 - `docs/themes.html`: mockup of the three themes.
-- `Makefile`, `dev.elmar.stream-deck-home.plist`: local install as a launch agent.
-- `~/.config/stream-deck-home/credentials.json`: tokens and hub certificate pins (mode 0600).
-- `~/.config/stream-deck-home/names.json`: your optional aliases and hide list.
-- `~/Library/Logs/stream-deck-home.log`: the log of the launch agent.
+- `Makefile`, `dev.elmar.hubdeck.plist`: local install as a launch agent.
+- `~/.config/hubdeck/credentials.json`: tokens and hub certificate pins (mode 0600).
+- `~/.config/hubdeck/names.json`: your optional aliases and hide list.
+- `~/Library/Logs/hubdeck.log`: the log of the launch agent.
 
 ## Known limits
 
