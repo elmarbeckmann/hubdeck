@@ -326,11 +326,12 @@ class UI:
         return self.stack[-1]
 
     def validate(self):
-        """Drop pages whose room or device vanished from the snapshot."""
+        """Drop pages whose room or device vanished from the snapshot. True when the stack changed."""
         rooms = {r["id"] for r in (self.home() or {"rooms": []})["rooms"]}
         sids = {d.sid for d in self.devs()}
-        self.stack = [p for p in self.stack if (p[0] != "room" or p[1] in rooms) and (p[0] != "detail" or p[1] in sids)]
-        self.stack = self.stack or [("home", 0)]
+        old = self.stack
+        self.stack = [p for p in old if (p[0] != "room" or p[1] in rooms) and (p[0] != "detail" or p[1] in sids)] or [("home", 0)]
+        return self.stack != old
 
     def is_on(self, d):
         m, v = self.model, lambda c, default=None: self.model.val(d.sid, c, default)
@@ -359,8 +360,7 @@ class UI:
             else:
                 out[0] = Key("Loading", "alert", GREY, ident="conn")
             return out
-        self.validate()  # a page can be stale (a key press during a snapshot): go back, never crash
-        p = self.page
+        p = self.page  # on_msg validates after each snapshot, so the page is not stale
         out = {"home": p_home, "room": p_room, "detail": p_detail, "scenes": p_scenes, "autos": p_autos,
                "status": p_status}[p[0]](self)
         for i, k in enumerate(out):
@@ -379,6 +379,8 @@ class UI:
                 self.last_input, self.swallow = now, i
                 return
             self.last_input = now
+            if self.connected and self.model.homes and self.validate():
+                return  # the page was stale: the user did not see the new page, so ignore the press
             self.cur = k = self.keys(now)[i]
             if k.repeat and k.tap:
                 self.act(k.tap, k.ident, now)
@@ -1448,7 +1450,8 @@ class Names:
         self.check()
 
     def load(self, raw):
-        table = lambda key: {str(a): str(b) for a, b in raw[key].items()} if isinstance(raw.get(key), dict) else {}
+        table = lambda key: {str(a).strip().casefold(): b.strip() for a, b in raw[key].items()
+                             if isinstance(b, str) and b.strip()} if isinstance(raw.get(key), dict) else {}  # null or empty: no alias
         hide = raw.get("hide", [])
         self.data = {"devices": table("devices"), "rooms": table("rooms"), "scenes": table("scenes"),
                      "hide": [str(p) for p in hide] if isinstance(hide, list) else []}  # one assignment: threads see all or nothing
@@ -1480,14 +1483,14 @@ class Names:
 
     def device(self, id, name):
         d = self.data["devices"]
-        return d.get(id) or d.get(name) or name
+        return d.get(id.strip().casefold()) or d.get(name.strip().casefold()) or name
 
     def room(self, name):
-        return self.data["rooms"].get(name) or name
+        return self.data["rooms"].get(name.strip().casefold()) or name.strip()
 
     def scene(self, id, name):
         d = self.data["scenes"]
-        return d.get(id) or d.get(name) or name
+        return d.get(id.strip().casefold()) or d.get(name.strip().casefold()) or name
 
     def hidden(self, *names):
         """True when a pattern of `hide` matches one of the names (hub name or alias; case does not matter)."""
@@ -1503,7 +1506,7 @@ def merge(parts, names=None):
 
     def room(n):
         """(id, name) of a room after aliasing, or None when it is hidden."""
-        shown = (names.room(n) if n else n) or "Other"
+        shown = names.room(n or "Other")
         return None if names.hidden(n, shown) else ("room:" + shown.strip().casefold(), shown.strip())
 
     for _, online, p in parts:
@@ -1521,8 +1524,9 @@ def merge(parts, names=None):
             accs.append({**a, "name": name, "services": svcs, "room": r[0], "reachable": a["reachable"] and online})
         for s in p["scenes"]:
             name = names.scene(s["id"], s["name"])
-            if not names.hidden(s["name"], name):
-                scenes.append({**s, "name": name, "room": names.room(s["room"]) if s.get("room") else ""})
+            r = room(s["room"]) if s.get("room") else ("", "")
+            if r is not None and not names.hidden(s["name"], name):  # a scene of a hidden room is dropped
+                scenes.append({**s, "name": name, "room": r[1]})
         trigs += p["triggers"]
     used = {a["room"] for a in accs}
     return {"id": "home", "name": "Home", "primary": True, "accessories": accs, "scenes": scenes, "triggers": trigs,
@@ -1594,7 +1598,7 @@ class Coalescer:
 
 
 class Source:
-    """One hub. Subclasses fill `refresh` (fetch everything), `stream` (live updates, blocks),
+    """One hub. Subclasses fill `fetch` (fetch everything, then call `load`), `stream` (live updates, blocks),
     `translate` (cache to model parts) and `_flush` (one coalesced write)."""
 
     name = label = ""
@@ -1606,7 +1610,25 @@ class Source:
         self.cfg, self.store = cfg, store
         self.online, self.lock = False, threading.RLock()
         self.notify = lambda: None
+        self.backlog, self.fetching = None, threading.Lock()  # backlog: events that arrive during a fetch
         self.co = Coalescer(self._flush_batch, self.delay)
+
+    def refresh(self):
+        """Fetch everything. The events that arrive meanwhile are applied again after the load."""
+        with self.fetching:
+            with self.lock:
+                self.backlog = []
+            try:
+                self.fetch()
+            finally:
+                with self.lock:
+                    self.backlog = None
+
+    def replay(self):
+        """Apply the events of the backlog to the new cache. Call with `lock` held."""
+        b, self.backlog = self.backlog, None
+        for ev in b or []:
+            self.apply_event(ev)
 
     def save(self):
         self.store.put(self.name, self.cfg)
@@ -1638,9 +1660,7 @@ class Source:
                 self.online, wait = True, RETRY
                 self.notify()
                 while True:  # stream() returns on a harmless timeout and raises on errors
-                    self.stream()
-                    self.refresh()  # the stream is open again: events of the gap are lost, so fetch everything
-                    self.notify()
+                    self.stream()  # after a timeout connect again; the `_full` thread covers missed events
             except Exception as error:
                 log(f"{self.name}: {describe(error)}")
             self.online = False
@@ -1709,7 +1729,7 @@ class Hue(Source):
         return hub_call(self.cfg["host"], 443, self.cfg["pin"], method, "/clip/v2" + path, body=body,
                         headers={"hue-application-key": self.cfg["key"]})
 
-    def refresh(self):
+    def fetch(self):
         st, obj, _ = self.call("GET", "/resource")
         if st != 200 or not isinstance(obj, dict):
             raise OSError(f"Hue Bridge answered HTTP {st}")
@@ -1722,6 +1742,7 @@ class Hue(Source):
                 res.setdefault(r["type"], {})[r["id"]] = r
         with self.lock:
             self.res = res
+            self.replay()
 
     def relocate(self):
         hit = find_hue(self.cfg.get("bridge_id"))
@@ -1761,6 +1782,8 @@ class Hue(Source):
         again (a resource was added, deleted or renamed, or a room, zone, scene or device changed its members)."""
         again = False
         with self.lock:
+            if self.backlog is not None:
+                self.backlog.append(events)  # a fetch is in flight: load() replays it
             for ev in events if isinstance(events, list) else []:
                 if ev.get("type") != "update":
                     again = again or ev.get("type") in ("add", "delete")
@@ -1972,7 +1995,7 @@ class Ikea(Source):
         return hub_call(self.cfg["host"], self.PORT, self.cfg["pin"], method, "/v1" + path, body=body,
                         headers={"Authorization": "Bearer " + self.cfg["token"]})
 
-    def refresh(self):
+    def fetch(self):
         st, devs, _ = self.call("GET", "/devices")
         if st != 200 or not isinstance(devs, list):
             raise OSError(f"DIRIGERA answered HTTP {st}")
@@ -1984,6 +2007,7 @@ class Ikea(Source):
         with self.lock:
             self.dev = {d["id"]: d for d in devs if isinstance(d, dict) and "id" in d}
             self.scn = {s["id"]: s for s in scn if isinstance(s, dict) and "id" in s}
+            self.replay()
 
     def relocate(self):
         ip = find_ikea()
@@ -2023,9 +2047,15 @@ class Ikea(Source):
             return False
         d = ev.get("data")
         with self.lock:
+            if self.backlog is not None:
+                self.backlog.append(ev)  # a fetch is in flight: load() replays it
             if ev.get("type") == "deviceStateChanged" and isinstance(d, dict) and d.get("id") in self.dev:
-                deep_merge(self.dev[d["id"]], d)
-                return "room" in d or "customName" in (dig(d, "attributes", default={}))  # renamed or moved: fetch again
+                old = self.dev[d["id"]]
+                new = dig(d, "attributes", default={})
+                moved = "room" in d and d["room"] != old.get("room")
+                renamed = "customName" in new and new["customName"] != (old.get("attributes") or {}).get("customName")
+                deep_merge(old, d)
+                return moved or renamed  # renamed or moved: fetch again
         return ev.get("type") in ("deviceAdded", "deviceRemoved", "sceneCreated", "sceneUpdated", "sceneDeleted",
                                   "roomCreated", "roomUpdated", "roomDeleted")
 
@@ -2178,7 +2208,7 @@ class Tado(Source):
             raise RateLimited(f"tado answered HTTP 429: no requests for {wait / 60:.0f} minutes")
         return st, obj
 
-    def refresh(self):
+    def fetch(self):
         hid = self.cfg["home_id"]
         try:
             if not self.zones:
@@ -2865,6 +2895,13 @@ def test_names():
     n.load({"hide": ["garage"]})
     home = merge(parts, n)
     assert [r["name"] for r in home["rooms"]] == ["Woonkamer"] and set(has(home)) == {"hue:1", "hue:s", "ikea:b"}
+    assert [(s["id"], s["room"]) for s in home["scenes"]] == [("hue:a", "Woonkamer"), ("ikea:s1", ""), ("ikea:s2", "")]  # the Garage scene is dropped
+    # lookups ignore case and outer spaces; null and empty aliases are off; an alias for "Other" applies
+    n.load({"devices": {" HANGLAMP ": " Pendant ", "ikea:a": None, "ikea:b": "  "}, "rooms": {"woonkamer ": "Salon", "other": "Misc"}})
+    assert n.device("hue:1", "hanglamp ") == "Pendant" and n.device("ikea:a", "Bureau") == "Bureau" and n.device("ikea:b", "Bureau") == "Bureau"
+    assert n.room(" WOONKAMER") == "Salon" and n.room("Garage ") == "Garage"
+    home = merge([("hue", True, {"rooms": [], "accessories": [lamp("hue:9", "Lamp", "")], "scenes": [], "triggers": []})], n)
+    assert [r["name"] for r in home["rooms"]] == ["Misc"]
     # the default hide list applies without a file only; a file without "hide" hides nothing
     assert Names("/nonexistent/names.json").hidden("dirigera_integration_emma") and not Names(None).hidden("dirigera_integration_emma")
     # the file: aliases load, an edit shows when the mtime changes, a broken file keeps the last good names
@@ -2919,6 +2956,18 @@ def test_names():
     ikea.load(IKEA_DEVICES, [])
     ev = lambda **d: ikea.apply_event({"type": "deviceStateChanged", "data": {"id": "i1", **d}})
     assert ev(attributes={"isOn": True}) is False and ev(attributes={"customName": "New"}) is True and ev(room={"name": "Hall"}) is True
+    assert ev(attributes={"customName": "New"}) is False and ev(room=dict(ikea.dev["i1"]["room"])) is False  # unchanged: no refetch
+    # an event that arrives during a fetch survives the load (replayed on the new cache)
+    ikea.fetch = lambda: (ev(attributes={"isOn": True}), ikea.load(IKEA_DEVICES, []))
+    ikea.dev["i1"]["attributes"]["isOn"] = False
+    ikea.refresh()
+    assert ikea.dev["i1"]["attributes"]["isOn"] is True and ikea.backlog is None
+    ikea.fetch = lambda: 1 / 0
+    try:
+        ikea.refresh()
+    except ZeroDivisionError:
+        pass
+    assert ikea.backlog is None and not ikea.fetching.locked()
     assert all(ikea.apply_event({"type": t}) for t in ("roomCreated", "roomUpdated", "roomDeleted", "deviceRemoved", "sceneUpdated"))
     # the full refresh runs for Hue and DIRIGERA, only while online; tado follows its poll interval
     seen = []
@@ -3060,7 +3109,11 @@ def test():
     ui3.on_msg(gone, 13)
     assert ui3.stack == [("home", 0), ("room", "living", 0)] and ui3.keys(13)[0].label == "Back"
     ui3.stack = [("home", 0), ("detail", "floor", 0)]  # a stale page, for example a key press during the snapshot
-    assert ui3.keys(14)[0].label != "Back" and ui3.stack == [("home", 0)]
+    ui3.last_input, ui3.cur = 13, None
+    ui3.key_event(0, True, 14)  # the press is ignored: the user did not see the new page
+    assert ui3.stack == [("home", 0)] and ui3.cur is None and ui3.held is None and not ui3.validate()
+    ui3.key_event(0, False, 14)
+    assert ui3.keys(14)[0].label != "Back"
     ui3.act(("trigger", "gone", True), "", 14)  # an automation that vanished: nothing happens
     # trigger toggle: optimistic and revert
     ui4 = test_ui()
@@ -3425,13 +3478,14 @@ def names_cmd():
         except Exception as error:
             print(f"{name:5} not reachable ({describe(error)})")
             continue
-        shown = lambda kind, id, hub, now: rows.append((kind, name, id, hub, now, names.hidden(hub, now)))
+        shown = lambda kind, id, hub, now, hide=False: rows.append((kind, name, id, hub, now, hide or names.hidden(hub, now)))
+        room_hidden = lambda r: names.hidden(r, names.room(r or "Other"))
         for r in dict.fromkeys(t["rooms"] + [a["room"] for a in t["accessories"] if a["room"]]):
             shown("room", "-", r, names.room(r))
         for a in sorted(t["accessories"], key=lambda a: (a["name"].lower(), a["id"])):
-            shown("device", a["id"], a["name"], names.device(a["id"], a["name"]))
+            shown("device", a["id"], a["name"], names.device(a["id"], a["name"]), room_hidden(a["room"]))
         for s in t["scenes"]:
-            shown("scene", s["id"], s["name"], names.scene(s["id"], s["name"]))
+            shown("scene", s["id"], s["name"], names.scene(s["id"], s["name"]), bool(s.get("room")) and room_hidden(s["room"]))
     print(f"names.json: {names.path} ({'found' if names.stamp else 'not found'})")
     for kind, source, id, hub, now, hide in sorted(rows, key=lambda r: ("room device scene".split().index(r[0]), r[1])):
         print(f"{kind:6} {source:5} {id:40} {hub}" + (f" -> {now}" if now != hub else "") + (" (hidden)" if hide else ""))
