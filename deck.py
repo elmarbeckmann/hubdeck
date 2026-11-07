@@ -1,39 +1,54 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12,<3.14"
-# dependencies = ["streamdeck>=0.9.6", "pillow>=10.1"]
+# dependencies = ["streamdeck>=0.9.6", "pillow>=10.1", "websocket-client>=1.7"]
 # ///
-"""Stream Deck control deck for HomeKit.
+"""Stream Deck control deck for the smart home.
 
-macOS gives HomeKit only to a signed Mac Catalyst app, so the app HomeDeckBridge (folder bridge/)
-talks to HomeKit and this script talks to the bridge over a local socket: newline-delimited JSON on
-127.0.0.1, token from ~/Library/Application Support/HomeDeck/bridge.json.
+It talks to the hubs directly: Philips Hue Bridge (CLIP v2), IKEA DIRIGERA (local API) and tado
+(cloud). A source adapter per hub translates it into one internal model (home, rooms, accessories,
+services, HAP characteristics) and translates writes back. Rooms with the same name from different
+hubs merge into one room.
 
 Home page: home, scenes, status, automations, all lights off, rooms. Room page: devices. A short
 press does the main action, a long press (0.5 s) opens the detail page. Locks, garage doors and the
 security system need a 1 s hold. Writes show at once and revert (key flashes red) when they fail.
 
-  uv run deck.py serve   # real bridge, owns the Stream Deck (Elgato app must be closed)
-  uv run deck.py demo    # same deck against a fake home, no bridge needed
-  uv run deck.py test    # self-check, no hardware needed
+  uv run deck.py pair hue|ikea|tado [--host IP]   # one-time pairing, asks for a button press
+  uv run deck.py status                           # paired hubs, reachability, counts
+  uv run deck.py unpair hue|ikea|tado             # forget the credentials of a hub
+  uv run deck.py serve   # owns the Stream Deck (Elgato app must be closed)
+  uv run deck.py demo    # same deck against a fake home, no hub needed
+  uv run deck.py test    # self-check, no hardware and no network needed
   uv run deck.py shots   # write PNG renders of some pages to /tmp/homedeck-*.png
 """
+import argparse
+import base64
 import colorsys
 import copy
 import functools
+import hashlib
+import hmac
+import http.client
 import json
+import math
 import os
 import queue
+import re
+import secrets
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
-from collections import namedtuple
+import urllib.parse
+from collections import Counter, namedtuple
 
-BRIDGE_FILE = os.path.expanduser("~/Library/Application Support/HomeDeck/bridge.json")
-BRIDGE_APP = os.path.expanduser("~/Applications/HomeDeckBridge.app")
+CRED_DIR = os.path.expanduser("~/.config/stream-deck-home")
+CRED_FILE = os.path.join(CRED_DIR, "credentials.json")
 BRIGHTNESS = 60
 DIM = 10  # brightness while idle
 IDLE_MINUTES = 5  # no key press for this long: dim the deck. The first press only wakes it.
@@ -41,19 +56,36 @@ LONG = 0.5  # seconds: a long press opens the detail page
 HOLD = 1.0  # seconds: locks, garage doors and the security system act after this hold
 REPEAT_DELAY, REPEAT = 0.5, 0.2  # auto-repeat of the +/- keys while held
 FLASH = 0.6  # seconds a key flashes after a scene or a failed write
-RETRY = 2.0  # seconds between bridge connection attempts
+RETRY, RETRY_MAX = 2.0, 60.0  # seconds before a hub is tried again; doubles up to the maximum
+HTTP_TIMEOUT = 10.0  # seconds for one request to a hub
+SSE_TIMEOUT = 300.0  # seconds without a byte from the Hue event stream before it reconnects
+WS_PING = 30.0  # seconds of silence on the DIRIGERA WebSocket before a ping
+COALESCE = 0.05  # seconds: writes to one device within this time become one request
+HUE_INTERVAL = 0.1  # seconds between Hue light commands (Hue allows about 10 per second)
+HUE_GROUP_INTERVAL = 1.0  # seconds between Hue grouped_light commands (Hue allows about 1 per second)
+IKEA_INTERVAL = 0.1  # seconds between DIRIGERA commands
+TADO_POLL = 15 * 60  # seconds between tado polls. Free accounts get about 100 requests per day: calibration knob
+TADO_COALESCE = 3.0  # seconds: tado target presses within this time become one request
+TADO_RATE_WAIT = 3600.0  # seconds to wait after HTTP 429 when tado sends no Retry-After
+TADO_TERMINATION = {"type": "TADO_MODE"}  # overlay ends at the next time block, like the tado app's default
+TADO_TERMINATION_FALLBACK = {"type": "MANUAL"}  # used once when tado answers HTTP 422 to the line above
+TADO_DEFAULT_TARGET = 21.0  # degrees when "Heat" is chosen and tado has no target yet
+IKEA_BLINDS_INVERTED = True  # DIRIGERA: blindsTargetLevel 0 = open, 100 = closed (unverified). HAP: 100 = open
+PAIR_SECONDS, PAIR_STEP = 60, 2  # pairing: how long and how often the hub is asked
+TADO_CLIENT = "1bb50063-6b0c-4d11-bd99-387f4a91cc46"
 
 # HAP short UUIDs of the services and characteristics (Apple's base UUID is added by HomeKit).
 KINDS = {"43": "light", "47": "outlet", "49": "switch", "40": "fan", "B7": "fan", "4A": "thermostat",
          "BC": "heater", "45": "lock", "41": "garage", "8C": "cover", "81": "cover", "8B": "cover",
          "7E": "security", "BB": "purifier", "D0": "valve", "8A": "temp", "82": "humidity",
          "80": "contact", "85": "motion", "86": "occupancy", "83": "leak", "87": "smoke", "7F": "co",
-         "84": "lux"}  # 96 (battery) is no device: it only sets the low battery badge
+         "84": "lux", "8D": "air"}  # 96 (battery) is no device: it only sets the low battery badge
 ON, BRI, HUE, SAT, CT, ACTIVE, SPEED = "25", "8", "13", "2F", "CE", "B0", "29"
 CURT, TARGT, CURMODE, TARMODE, HUM = "11", "35", "F", "33", "10"
 LOCKC, LOCKT, DOORC, DOORT, OBST, POSC, POST, SECC, SECT = "1D", "1E", "E", "32", "24", "6D", "7C", "66", "67"
 HMODE, HEATTH, COOLTH = "B2", "12", "D"
 CONTACT, MOTION, OCC, LEAK, SMOKE, CO, LUX, LOWBAT, BATLVL, CHARGING = "6A", "22", "71", "70", "76", "69", "6B", "79", "68", "8F"
+PM25 = "C6"
 BASE_UUID = "-0000-1000-8000-0026BB765291"
 # Optimistic mirror: writing the target char also moves the current-state char at once.
 MIRROR = {LOCKT: (LOCKC, lambda v: v), POST: (POSC, lambda v: v), SECT: (SECC, lambda v: v),
@@ -62,7 +94,7 @@ INT_FORMATS = {"int", "uint8", "uint16", "uint32", "uint64"}
 TOGGLE = {"light", "outlet", "switch", "fan", "purifier", "valve"}  # short press toggles
 HOLD_KINDS = {"lock", "garage", "security"}  # short press does nothing, 1 s hold acts
 OPENS_DETAIL = {"thermostat", "heater", "cover"}  # short press opens the detail page too
-SENSORS = {"temp", "humidity", "contact", "motion", "occupancy", "leak", "smoke", "co", "lux"}
+SENSORS = {"temp", "humidity", "contact", "motion", "occupancy", "leak", "smoke", "co", "lux", "air"}
 HAZARDS = {"leak": LEAK, "smoke": SMOKE, "co": CO}
 LOW_BATTERY = 20  # percent
 
@@ -72,11 +104,19 @@ WHITE, PURPLE = (255, 255, 255), (110, 55, 160)
 HUES = [("Red", 0), ("Orange", 30), ("Yellow", 55), ("Green", 120), ("Cyan", 180), ("Blue", 240),
         ("Purple", 280), ("Pink", 330)]
 GLYPH = {"security": "shield", "leak": "drop", "humidity": "drop", "smoke": "cloud", "occupancy": "person",
-         "lux": "sun", "heater": "flame", "thermostat": "thermo", "cover": "blinds", "light": "bulb"}  # kind -> glyph
+         "lux": "sun", "air": "cloud", "heater": "flame", "thermostat": "thermo", "cover": "blinds", "light": "bulb"}  # kind -> glyph
 MODES = [("Off", None), ("Heat", 1), ("Cool", 2), ("Auto", 0)]  # name, HeaterCooler target state
 
-Key = namedtuple("Key", "label glyph fill bar badge low sub hint ident tap hold long repeat sel",
-                 defaults=("", None, DARK, None, "", False, "", "", "", None, None, None, False, False))
+# cat, on and rgb only matter for the look (see paint_*): cat is the kind of key (a navigation key such as
+# "home", "scenes", "alert", "auto", "off", "back", or "room", "light", "dev", "climate", "sensor", or ""
+# for a plain button), on is lit or not, rgb is the light color or the category color of the device.
+Key = namedtuple("Key", "label glyph fill bar badge low sub hint ident tap hold long repeat sel cat on rgb",
+                 defaults=("", None, DARK, None, "", False, "", "", "", None, None, None, False, False, "", False, None))
+THEME = "graphite"  # key look: graphite, vivid or neon. Change with --theme or STREAM_DECK_HOME_THEME (docs/themes.html)
+THEMES = ("graphite", "vivid", "neon")
+DEVICE_RGB = {"outlet": (52, 199, 89), "switch": (52, 199, 89), "fan": (90, 200, 250), "purifier": (90, 200, 250),
+              "valve": (90, 200, 250), "cover": (90, 200, 250), "garage": (255, 159, 10)}  # devices without a light color
+ALERT_RGB, SAFE_RGB, WARN_RGB, INFO_RGB = (255, 69, 58), (48, 209, 88), (255, 159, 10), (10, 132, 255)
 EMPTY = Key(fill=BLACK)
 Dev = namedtuple("Dev", "sid name acc room kind")
 
@@ -89,15 +129,6 @@ def short(uuid):
 
 def full(short_id):
     return f"{int(short_id, 16):08X}{BASE_UUID}"
-
-
-def parse(line):
-    """One protocol line to a dict, or None when it is not a JSON object."""
-    try:
-        obj = json.loads(line)
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
 
 
 def clamp(ch, value):
@@ -315,14 +346,17 @@ class UI:
     def keys(self, now):
         if not self.connected or not self.model.homes:
             out = [EMPTY] * 15
-            out[0] = Key("Bridge\noffline" if not self.connected else "Loading", "alert", RED if not self.connected else GREY, ident="conn")
+            if not self.connected:  # text only, so that the hub list has room
+                out[0] = Key(getattr(self.link, "offline", "Offline"), None, RED, ident="conn")
+            else:
+                out[0] = Key("Loading", "alert", GREY, ident="conn")
             return out
         p = self.page
         out = {"home": p_home, "room": p_room, "detail": p_detail, "scenes": p_scenes, "autos": p_autos,
                "status": p_status}[p[0]](self)
         for i, k in enumerate(out):
             if k.ident in self.flash and self.flash[k.ident][0] > now:
-                out[i] = k._replace(fill=self.flash[k.ident][1], sel=False)
+                out[i] = k._replace(fill=self.flash[k.ident][1], sel=False, cat="", on=False, rgb=None)  # plain key in the flash color
         return out
 
     def brightness(self, now):
@@ -451,7 +485,12 @@ def place(out, items, first, n):
 
 
 def back_key():
-    return Key("Back", "back", tap=("back",))
+    return Key("Back", "back", tap=("back",), cat="back", on=True)
+
+
+def light_rgb(m, sid):
+    """The real color of a light at full brightness: hue and saturation, else white from mireds."""
+    return light_color(True, m.val(sid, HUE), m.val(sid, SAT), 100, m.val(sid, CT))
 
 
 def p_home(ui):
@@ -460,18 +499,21 @@ def p_home(ui):
     on = sum(ui.is_on(d) for d in lights)
     alerts = ui.alerts()
     out = [EMPTY] * 15
-    out[0] = Key(f"{home['name']}\n{on} on", "home", WARM if on else DARK, ident="home",
+    out[0] = Key(home["name"], "home", WARM if on else DARK, sub=f"{on} on", ident="home", cat="home", on=True,
                  tap=("home_next",) if len(m.homes) > 1 else None)
-    out[1] = Key("Scenes", "play", tap=("goto", ("scenes", 0)))
-    out[2] = Key("Status", "info", RED if alerts else DARK, badge=str(alerts) if alerts else "", tap=("goto", ("status", 0)))
-    out[3] = Key("Automations", "clock", tap=("goto", ("autos", 0)))
-    out[4] = Key("All\nlights off", "power", tap=("power", tuple(d.sid for d in lights), False))
+    out[1] = Key("Scenes", "play", tap=("goto", ("scenes", 0)), cat="scenes", on=True)
+    out[2] = Key("Status", "info", RED if alerts else DARK, badge=str(alerts) if alerts else "", tap=("goto", ("status", 0)),
+                 cat="alert" if alerts else "off", on=True)
+    out[3] = Key("Automations", "clock", tap=("goto", ("autos", 0)), cat="auto", on=True)
+    out[4] = Key("All\nlights off", "power", tap=("power", tuple(d.sid for d in lights), False), cat="off", on=True)
     rooms = []
     for r in home["rooms"]:
         ds = [d for d in ui.devs() if d.room == r["id"] and d.kind not in SENSORS]
-        lit = any(ui.is_on(d) for d in ds if d.kind == "light")
+        lit = [d for d in ds if d.kind == "light" and ui.is_on(d)]
+        cols = [light_rgb(m, d.sid) for d in lit]
+        avg = tuple(round(sum(c[i] for c in cols) / len(cols)) for i in range(3)) if cols else None  # mean light color
         rooms.append(Key(r["name"], None, WARM if lit else DARK, sub=f"{sum(ui.is_on(d) for d in ds)}/{len(ds)}",
-                         tap=("goto", ("room", r["id"], 0))))
+                         tap=("goto", ("room", r["id"], 0)), cat="room", on=bool(lit), rgb=avg))
     return place(out, rooms, 5, ui.page[1])
 
 
@@ -483,7 +525,8 @@ def p_room(ui):
     out = [EMPTY] * 15
     out[0] = back_key()
     if switchable:
-        out[1] = Key("All off" if any_on else "All on", "power", tap=("power", tuple(d.sid for d in switchable), not any_on))
+        out[1] = Key("All off" if any_on else "All on", "power", tap=("power", tuple(d.sid for d in switchable), not any_on),
+                     cat="off", on=True)
     return place(out, [dev_key(ui, d) for d in ds], 2, n)
 
 
@@ -525,8 +568,20 @@ def dev_key(ui, d):
         k.update(fill=BLUE if ui.is_on(d) else OFF, tap=("toggle", sid), long=detail)
     else:  # sensors
         k.update(**sensor_face(ui, d))
+    # look: what the themes need
+    if kind == "light":
+        k.update(cat="light", on=ui.is_on(d), rgb=light_rgb(m, sid))
+    elif kind in ("thermostat", "heater"):
+        k.update(cat="climate", on=True)
+    elif kind in SENSORS:
+        hot = ui.hazard(d) or (kind == "contact" and v(CONTACT) == 1)
+        k.update(cat="sensor", on=bool(hot), rgb=ALERT_RGB if hot else None)
+    else:
+        rgb = {"lock": SAFE_RGB if v(LOCKC) == 1 else WARN_RGB, "security": INFO_RGB if v(SECC, 3) != 3 else SAFE_RGB}.get(kind)
+        k.update(cat="dev", on=ui.is_on(d) or kind in HOLD_KINDS, rgb=rgb or DEVICE_RGB.get(kind, SAFE_RGB))
     if not reach:
-        k.update(fill=GREY, badge="!", bar=None, tap=None, hold=None, long=None, hint="")
+        k.update(fill=GREY, badge="!", bar=None, tap=None, hold=None, long=None, hint="", cat="light" if kind == "light" else "dev",
+                 on=False, rgb=None)
     return Key(**k)
 
 
@@ -539,6 +594,8 @@ def sensor_face(ui, d):
         return dict(sub=f"{v(HUM) or 0:.0f}%")
     if kind == "lux":
         return dict(sub=f"{v(LUX) or 0:.0f}lx")
+    if kind == "air":
+        return dict(sub=f"{v(PM25) or 0:.0f}µg")
     if kind == "contact":
         return dict(glyph="door_open", fill=RED, sub="open") if v(CONTACT) == 1 else dict(glyph="door", sub="shut")
     if kind in ("motion", "occupancy"):
@@ -592,9 +649,13 @@ def p_detail(ui):
         if has(sp):
             items += [kk("-0.5", ("adjust", sid, sp, -0.5), repeat=True), readout("Target", "flame", f"{v(sp, 0):.1f}°"),
                       kk("+0.5", ("adjust", sid, sp, 0.5), repeat=True)]
+        valid = (m.char(sid, TARMODE) or {}).get("valid")  # modes the device supports; None = all
         for name, mode in MODES:
             if d.kind == "thermostat":
-                act, sel = w(TARMODE, {"Off": 0, "Heat": 1, "Cool": 2, "Auto": 3}[name]), v(TARMODE) == {"Off": 0, "Heat": 1, "Cool": 2, "Auto": 3}[name]
+                code = {"Off": 0, "Heat": 1, "Cool": 2, "Auto": 3}[name]
+                if valid is not None and code not in valid:
+                    continue
+                act, sel = w(TARMODE, code), v(TARMODE) == code
             elif mode is None:
                 act, sel = w(ACTIVE, 0), not v(ACTIVE)
             else:
@@ -669,6 +730,11 @@ def p_status(ui):
 def font(size):
     from PIL import ImageFont
     return ImageFont.load_default(size=size)
+
+
+def bold(d, xy, text, size, fill, anchor="mm"):
+    """Bold text: the default font has no bold face, so a 1 px stroke thickens it."""
+    d.text(xy, text, font=font(size), fill=fill, anchor=anchor, stroke_width=1, stroke_fill=fill)
 
 
 def glyph(d, name, cx, cy, size, fg):
@@ -751,7 +817,12 @@ def glyph(d, name, cx, cy, size, fg):
         d.ellipse(box(0, -3, 12, 9), fill=fg)
         d.rectangle(box(-7, 2, 7, 9), fill=fg)
     elif name == "co":
-        d.text((cx, cy), "CO", font=font(max(8, round(size * 1.2))), fill=fg, anchor="mm")
+        d.arc(box(-11, -8, 3, 8), 40, 320, fill=fg, width=W + 1)
+        d.ellipse(box(3, -8, 12, 1), outline=fg, width=W)
+    elif name == "sensor":
+        glyph(d, "motion", cx, cy, size, fg)
+    elif name == "plug":
+        glyph(d, "outlet", cx, cy, size, fg)
     elif name == "sun":
         d.ellipse(box(-5, -5, 5, 5), fill=fg)
         for dx, dy in ((0, 1), (1, 0), (1, 1), (1, -1)):
@@ -772,7 +843,8 @@ def glyph(d, name, cx, cy, size, fg):
         d.polygon(P(-6, -11, 11, 0, -6, 11), fill=fg)
     elif name == "info":
         d.ellipse(box(-11, -11, 11, 11), outline=fg, width=W)
-        d.text((cx, cy), "i", font=font(max(8, round(size * 1.3))), fill=fg, anchor="mm")
+        d.rectangle(box(-1.3, -1, 1.3, 7), fill=fg)
+        d.rectangle(box(-1.3, -7, 1.3, -4.5), fill=fg)
     elif name == "clock":
         d.ellipse(box(-11, -11, 11, 11), outline=fg, width=W)
         d.line(P(0, 0, 0, -7), fill=fg, width=W)
@@ -786,118 +858,1296 @@ def glyph(d, name, cx, cy, size, fg):
     elif name == "snow":
         for a in ((0, 12), (10, 6), (10, -6)):
             d.line(P(-a[0], -a[1], a[0], a[1]), fill=fg, width=W)
-    elif name == "auto":
-        d.text((cx, cy), "A", font=font(max(8, round(size * 1.6))), fill=fg, anchor="mm")
+    elif name == "auto":  # circular arrows
+        d.arc(box(-10, -10, 10, 10), 200, 340, fill=fg, width=W + 1)
+        d.arc(box(-10, -10, 10, 10), 20, 160, fill=fg, width=W + 1)
+        d.polygon(P(7, -12, 12, -4, 3, -5), fill=fg)
+        d.polygon(P(-7, 12, -12, 4, -3, 5), fill=fg)
 
 
-def face(key, size=72):
-    """Draw one key image (PIL, RGB) from a Key."""
-    from PIL import Image, ImageDraw
+# --- themes: the rules of docs/themes.html (themes[...].key(k)) ported to PIL ---
 
-    img = Image.new("RGB", (size, size), key.fill)
-    d = ImageDraw.Draw(img)
-    fg = (0, 0, 0) if sum(key.fill) / 3 > 150 else WHITE
-    lines = [w for part in key.label.split("\n") for w in (textwrap.wrap(part, 11) or [""])]
-    bottom = size - 7 if key.bar is not None else size - 3
-    if key.glyph is None and not key.sub:  # text only: centered
-        f = font(15 if len(lines) <= 2 else 12)
-        d.multiline_text((size / 2, size / 2), "\n".join(lines[:4]), font=f, fill=fg, anchor="mm", align="center")
-    else:
-        lines = lines[:2]
-        d.multiline_text((size / 2, bottom), "\n".join(lines), font=font(11), fill=fg, anchor="md", align="center")
-        if key.sub and key.glyph:
-            glyph(d, key.glyph, 12, 13, 7, fg)
-            d.text((size / 2 + 4, 27), key.sub, font=font(19 if len(key.sub) <= 4 else 13), fill=fg, anchor="mm")
-        elif key.sub:
-            d.text((size / 2, 25), key.sub, font=font(19 if len(key.sub) <= 4 else 13), fill=fg, anchor="mm")
-        else:
-            glyph(d, key.glyph, size / 2, 24, 13, fg)
-    if key.hint:
-        d.text((3, 2), key.hint, font=font(10), fill=(255, 210, 0) if fg == WHITE else (120, 0, 0))
-    if key.bar is not None:
-        d.rectangle((4, size - 5, size - 5, size - 3), fill=(0, 0, 0))
-        d.rectangle((4, size - 5, 4 + (size - 9) * max(0.0, min(1.0, key.bar)), size - 3), fill=fg)
-    if key.low:
-        glyph(d, "battery", size - 28 if key.badge else size - 11, 10, 6, (255, 210, 0))
-    if key.badge:
-        d.ellipse((size - 20, 2, size - 2, 20), fill=RED if key.badge != "!" else (230, 80, 0))
-        d.text((size - 11, 11), key.badge, font=font(13), fill=WHITE, anchor="mm")
-    if key.sel:
-        d.rectangle((0, 0, size - 1, size - 1), outline=WHITE, width=3)
+CAT_RGB = {"home": (255, 159, 10), "scenes": (255, 55, 95), "alert": (255, 69, 58), "auto": (10, 132, 255),
+           "off": (142, 142, 147), "back": (142, 142, 147)}
+VIVID_HUE = {"home": 30, "scenes": 330, "alert": 2, "auto": 212}
+CLIMATE_RGB, SENSOR_RGB = (255, 120, 60), (100, 210, 255)
+CRT = 9  # corner radius in px at 72 px
+
+
+def hexrgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def hsl(h, s, l):
+    return tuple(round(c * 255) for c in colorsys.hls_to_rgb((h % 360) / 360, max(0, min(100, l)) / 100, s / 100))
+
+
+def dim(c, f):
+    return tuple(round(v * f) for v in c)
+
+
+def room_hue(name):
+    return sum(ord(c) * (i + 7) for i, c in enumerate(name)) % 360  # stable hue per room name
+
+
+def look(key):
+    """A key as the themes see it: (cat, on, rgb). Keys without a category (detail page buttons, flashes)
+    are lit with their fill color."""
+    if key.cat:
+        return key.cat, key.on, key.rgb
+    lit = key.fill not in (BLACK, DARK, OFF, GREY)
+    return "dev", lit or key.sel, key.fill if lit else (WHITE if key.sel else None)
+
+
+@functools.lru_cache(maxsize=512)
+def gradient(c1, c2, size):
+    """Diagonal gradient (about 145 deg) from c1 (top left) to c2."""
+    from PIL import Image
+    img = Image.new("RGB", (size, size))
+    img.putdata([tuple(round(a + (b - a) * (x + y) / (2 * size - 2)) for a, b in zip(c1, c2)) for y in range(size) for x in range(size)])
     return img
 
 
-def sheet(keys, gap=8, size=72):
+def vertical(c1, c2, size):
+    from PIL import Image
+    img = Image.new("RGB", (size, size), c2)
+    d = ImageDraw_(img)
+    for y in range(size):
+        d.line((0, y, size, y), fill=tuple(round(a + (b - a) * y / (size - 1)) for a, b in zip(c1, c2)))
+    return img
+
+
+def ImageDraw_(img):
+    from PIL import ImageDraw
+    return ImageDraw.Draw(img)
+
+
+def glow(img, rgb, alpha, rx, ry, cx, cy):
+    """Radial glow of `rgb` (alpha at the center, 0 at the edge of the ellipse) over img."""
+    from PIL import Image, ImageOps
+    w, h = max(1, round(2 * rx)), max(1, round(2 * ry))
+    mask = ImageOps.invert(Image.radial_gradient("L")).resize((w, h)).point(lambda v: round(v * alpha))
+    img.paste(Image.new("RGB", (w, h), rgb), (round(cx - rx), round(cy - ry)), mask)
+
+
+def ring(img, rgb, size):
+    """Neon: dark key, faint fill, 2 px ring and an inner glow."""
+    from PIL import Image, ImageDraw, ImageFilter
+    base = hexrgb("#0b0b0d")
+    img.paste(base, (0, 0, size, size))
+    glow(img, rgb, .14, size * .9, size * .9, size / 2, size / 2)
+    edge = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(edge).rounded_rectangle((0, 0, size - 1, size - 1), round(CRT * size / 72), outline=255, width=4)
+    img.paste(Image.new("RGB", (size, size), rgb), (0, 0), edge.filter(ImageFilter.GaussianBlur(size / 12)).point(lambda v: round(v * .6)))
+    ImageDraw.Draw(img).rounded_rectangle((0, 0, size - 1, size - 1), round(CRT * size / 72), outline=rgb, width=2)
+
+
+def paint(img, key, theme):
+    """Draw the background of a key. Returns (icon and value color, label color, bar color, badge color)."""
+    size, (cat, on, rgb) = img.width, look(key)
+    offline = key.badge == "!"
+    level = key.bar * 100 if key.bar is not None else 80
+    if theme == "graphite":
+        base = lambda: img.paste(vertical(hexrgb("#22252c"), hexrgb("#14161b"), size))
+        if offline:
+            base()
+            return hexrgb("#555a63"), hexrgb("#555a63"), None, hexrgb("#ff9f0a")
+        if cat in CAT_RGB:
+            base()
+            return CAT_RGB[cat], hexrgb("#d8dbe0"), None, WHITE
+        if cat in ("room", "climate") and (on or cat == "climate"):
+            img.paste(vertical(hexrgb("#1a1c22"), hexrgb("#1a1c22"), size))
+            glow(img, rgb if cat == "room" else CLIMATE_RGB, .85 if cat == "room" else .8, size * .9, size * .63, size / 2, size * 1.2)
+            return WHITE, WHITE, None, WHITE
+        if cat == "sensor" and not on:
+            base()
+            return hexrgb("#64d2ff"), hexrgb("#d8dbe0"), None, WHITE
+        if on and rgb:
+            img.paste(vertical(hexrgb("#16181d"), hexrgb("#16181d"), size))
+            glow(img, rgb, .25 + .6 * level / 100, size * .975, size * .75, size / 2, size * 1.25)
+            return rgb, WHITE, rgb, WHITE
+        base()
+        return hexrgb("#4d525b"), hexrgb("#8b919c"), None, WHITE
+    if theme == "vivid":
+        g = lambda h, s=80, l=52: img.paste(gradient(hsl(h, s, l + 8), hsl(h + 18, s, l - 14), size))
+        if offline or (not on and cat not in CAT_RGB and cat not in ("climate", "room", "sensor")):
+            img.paste(hexrgb("#1c1c1e"), (0, 0, size, size))
+            return hexrgb("#6e6e73"), hexrgb("#6e6e73"), None, hexrgb("#ff453a")
+        if cat in ("off", "back"):
+            img.paste(gradient(hexrgb("#48484a"), hexrgb("#2c2c2e"), size))
+            return WHITE, WHITE, None, WHITE
+        if cat in VIVID_HUE:
+            g(VIVID_HUE[cat])
+            return WHITE, WHITE, None, WHITE
+        if cat == "room":
+            h = room_hue(key.label)
+            if on:
+                g(h)
+                return WHITE, WHITE, None, WHITE
+            img.paste(gradient(hsl(h, 25, 22), hsl(h, 25, 12), size))
+            return hsl(h, 40, 70), hsl(h, 40, 70), None, WHITE
+        if cat == "climate":
+            g(18, 90, 55)
+            return WHITE, WHITE, None, WHITE
+        if cat == "sensor" and not on:
+            g(190, 70, 40)
+            return WHITE, WHITE, None, WHITE
+        c = rgb or WHITE
+        light = c[0] * .3 + c[1] * .59 + c[2] * .11 > 170
+        img.paste(gradient(c, dim(c, .55), size))
+        fg = hexrgb("#1c1c1e") if light else WHITE
+        return fg, fg, fg, WHITE
+    # neon
+    if offline or (not on and cat not in CAT_RGB and cat not in ("climate", "sensor")):
+        img.paste(hexrgb("#0b0b0d"), (0, 0, size, size))
+        ImageDraw_(img).rounded_rectangle((0, 0, size - 1, size - 1), round(CRT * size / 72), outline=hexrgb("#2a2a2e"), width=2)
+        return hexrgb("#5a5a60"), hexrgb("#5a5a60"), None, hexrgb("#ff453a")
+    c = CAT_RGB.get(cat) or (CLIMATE_RGB if cat == "climate" else SENSOR_RGB if cat == "sensor" and not on else rgb or WHITE)
+    ring(img, c, size)
+    return c, hexrgb("#e5e5ea") if cat in CAT_RGB else WHITE, c, WHITE
+
+
+def face(key, size=72, theme=None):
+    """Draw one key image (PIL, RGB) from a Key in a theme (graphite, vivid or neon)."""
+    from PIL import Image, ImageDraw
+
+    theme = theme or THEME
+    img = Image.new("RGB", (size, size), (0, 0, 0))
+    if key.label == "" and key.glyph is None and not key.sub and not key.badge:  # empty key
+        img.paste(hexrgb("#0e0e10"), (0, 0, size, size))
+    else:
+        ink, txt, bar, badge = paint(img, key, theme)
+        d = ImageDraw.Draw(img)
+        lines = [w for part in key.label.split("\n") for w in (textwrap.wrap(part, 11) or [""])]
+        bottom = size - 11 if key.bar is not None else size - 4
+        if key.glyph is None and not key.sub:  # text only: centered
+            f = font(15 if len(lines) <= 2 else 12)
+            d.multiline_text((size / 2, size / 2), "\n".join(lines[:4]), font=f, fill=ink, anchor="mm", align="center")
+        else:
+            d.multiline_text((size / 2, bottom), "\n".join(lines[:2]), font=font(11), fill=txt, anchor="md", align="center")
+            if key.sub and key.glyph:
+                glyph(d, key.glyph, 12, 13, 7, ink)
+                bold(d, (size / 2 + 4, 26), key.sub, 17 if len(key.sub) <= 4 else 13, ink)
+            elif key.sub:
+                bold(d, (size / 2, 25), key.sub, 17 if len(key.sub) <= 4 else 13, ink)
+            else:
+                glyph(d, key.glyph, size / 2, 23, 12, ink)
+        if key.hint:
+            d.text((3, 2), key.hint, font=font(10), fill=(255, 210, 0))
+        if key.bar is not None:  # 3 px level bar
+            d.rounded_rectangle((8, size - 7, size - 9, size - 5), 1, fill=tuple(round(c * .3 + 25) for c in ink))
+            d.rounded_rectangle((8, size - 7, 8 + (size - 17) * max(0.0, min(1.0, key.bar)), size - 5), 1, fill=bar or ink)
+        if key.low:
+            glyph(d, "battery", size - 28 if key.badge else size - 11, 10, 6, (255, 210, 0))
+        if key.badge:
+            bold(d, (size - 9, 9), key.badge, 13, badge)
+        if key.sel:
+            d.rounded_rectangle((0, 0, size - 1, size - 1), round(CRT * size / 72), outline=WHITE, width=3)
+    mask = Image.new("L", (size, size), 0)  # rounded corners
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), round(CRT * size / 72), fill=255)
+    out = Image.new("RGB", (size, size), (0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def sheet(keys, gap=8, size=72, theme=None):
     """All 15 keys in a 5x3 grid, like the deck."""
     from PIL import Image
 
     img = Image.new("RGB", (5 * size + 4 * gap, 3 * size + 2 * gap), (10, 10, 10))
     for i, k in enumerate(keys):
-        img.paste(face(k, size), ((i % 5) * (size + gap), (i // 5) * (size + gap)))
+        img.paste(face(k, size, theme), ((i % 5) * (size + gap), (i // 5) * (size + gap)))
     return img
 
 
-# --- bridge links ---
+# --- hubs: credentials, TLS, discovery, helpers ---
 
-class Link:
-    """Real bridge: socket thread that connects, authenticates and reconnects."""
+def log(msg):
+    print(msg, flush=True)
 
-    def __init__(self, events):
-        self.events, self.sock, self.lock, self.connected = events, None, threading.Lock(), False
 
-    def start(self):
+def describe(error):
+    """Short text of an exception for logs. Our own messages never contain tokens."""
+    return f"{type(error).__name__}: {error}"
+
+
+class Creds:
+    """~/.config/stream-deck-home/credentials.json: mode 0600 in a folder with mode 0700.
+    These tokens control the house (locks too). They are never printed or logged."""
+
+    def __init__(self, path=CRED_FILE):
+        self.path, self.lock = path, threading.Lock()
+
+    def load(self):
+        try:
+            if os.stat(self.path).st_mode & 0o077:
+                os.chmod(self.path, 0o600)  # somebody widened the mode: close it again
+            with open(self.path) as f:
+                data = json.load(f)  # a corrupt file raises: never overwrite tokens we cannot read
+        except FileNotFoundError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def get(self, name):
+        return self.load().get(name)
+
+    def put(self, name, value):
+        """Save the entry of one hub (None removes it). The file is replaced in one step."""
+        with self.lock:
+            data = self.load()
+            if value is None:
+                data.pop(name, None)
+            else:
+                data[name] = value
+            folder = os.path.dirname(self.path)
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            os.chmod(folder, 0o700)
+            fd, tmp = tempfile.mkstemp(dir=folder)  # created with mode 0600
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+
+
+class PinError(OSError):
+    pass
+
+
+def fingerprint(der):
+    return hashlib.sha256(der).hexdigest()
+
+
+def pinned_socket(host, port, pin, first_use=False, timeout=HTTP_TIMEOUT):
+    """TLS socket to a hub with a self-signed certificate. The certificate must have the SHA-256
+    fingerprint `pin`; this is checked before anything is sent. Without a pin the call fails, unless
+    first_use=True (pairing only: the caller saves the fingerprint, see sock_pin)."""
+    if pin is None and not first_use:
+        raise PinError("no pinned certificate for this hub: pair it again")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # replaced by the pin check below
+    sock = ctx.wrap_socket(socket.create_connection((host, port), timeout))
+    if pin is not None and not hmac.compare_digest(sock_pin(sock), pin):
+        sock.close()
+        raise PinError("the certificate of the hub changed (hub reset?): pair it again")
+    return sock
+
+
+def sock_pin(sock):
+    return fingerprint(sock.getpeercert(True))
+
+
+def https(host, port, pin, first_use=False):
+    """HTTPS connection to a hub, pinned like pinned_socket. conn.pin is the fingerprint."""
+    conn = http.client.HTTPSConnection(host, port, timeout=HTTP_TIMEOUT)
+    conn.sock = pinned_socket(host, port, pin, first_use)
+    conn.pin = sock_pin(conn.sock)
+    return conn
+
+
+def request(conn, method, path, body=None, headers=None, form=None):
+    """One request. Returns (status, parsed JSON or None, response headers)."""
+    h, data = dict(headers or {}), None
+    if form is not None:
+        data, h["Content-Type"] = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+    elif body is not None:
+        data, h["Content-Type"] = json.dumps(body).encode(), "application/json"
+    conn.request(method, path, data, h)
+    r = conn.getresponse()
+    raw = r.read()
+    try:
+        obj = json.loads(raw) if raw else None
+    except ValueError:
+        obj = None
+    return r.status, obj, r.headers
+
+
+def hub_call(host, port, pin, method, path, first_use=False, **kw):
+    conn = https(host, port, pin, first_use)
+    try:
+        return request(conn, method, path, **kw)
+    finally:
+        conn.close()
+
+
+def cloud_call(host, method, path, **kw):
+    """Request to a cloud service with the normal certificate check."""
+    conn = http.client.HTTPSConnection(host, timeout=HTTP_TIMEOUT)
+    try:
+        return request(conn, method, path, **kw)
+    finally:
+        conn.close()
+
+
+def ok_resp(status, obj):
+    return status in (200, 201, 202, 204) and not (isinstance(obj, dict) and obj.get("errors"))
+
+
+def dns_sd(args, wait):
+    """Run `dns-sd` for `wait` seconds and return what it printed."""
+    p = subprocess.Popen(["dns-sd", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    threading.Timer(wait, p.kill).start()
+    return p.communicate()[0]
+
+
+def parse_browse(out):
+    """Instance names from `dns-sd -B` output."""
+    return re.findall(r"^\S+\s+Add\s+\d+\s+\d+\s+\S+\s+\S+\s+(.+?)\s*$", out, re.M)
+
+
+def parse_lookup(out):
+    """(host, port, TXT dict) from `dns-sd -L` output, or None."""
+    m = re.search(r"can be reached at (\S+?)\.?:(\d+)", out)
+    if not m:
+        return None
+    rest = out[m.end():].split("\n")[1:2]  # the TXT record is on the next line
+    return m.group(1), int(m.group(2)), dict(re.findall(r"(\w+)=(\S+)", rest[0])) if rest else {}
+
+
+def mdns(stype, wait=3.0):
+    """Hubs that announce `stype` on the local network: [{"name", "ip", "port", "txt"}]."""
+    found = []
+    try:
+        for name in parse_browse(dns_sd(["-B", stype, "local"], wait)):
+            hit = parse_lookup(dns_sd(["-L", name, stype, "local"], 2.0))
+            if hit:
+                host, port, txt = hit
+                try:
+                    ip = txt.get("ipv4address") or socket.getaddrinfo(host, port, socket.AF_INET)[0][4][0]
+                except OSError:
+                    continue
+                found.append({"name": name, "ip": ip, "port": port, "txt": txt})
+    except OSError:  # no dns-sd
+        pass
+    return found
+
+
+def find_hue(bridge_id=None):
+    """{"host", "bridge_id"} of a Hue Bridge (the one with `bridge_id` when given), or None."""
+    want = bridge_id.upper() if bridge_id else None
+    for h in mdns("_hue._tcp"):
+        bid = h["txt"].get("bridgeid", "").upper()
+        if want is None or bid == want:
+            return {"host": h["ip"], "bridge_id": bid}
+    try:  # fallback: the Hue cloud lists the bridges behind your public address
+        _, obj, _ = cloud_call("discovery.meethue.com", "GET", "/")
+        for b in obj or []:
+            if want is None or b["id"].upper() == want:
+                return {"host": b["internalipaddress"], "bridge_id": b["id"].upper()}
+    except (OSError, KeyError, TypeError):
+        pass
+    return None
+
+
+def find_ikea():
+    """IP of a DIRIGERA hub, or None."""
+    for h in mdns("_ihsp._tcp"):
+        if h["txt"].get("type", "DIRIGERA") == "DIRIGERA":
+            return h["ip"]
+    return next((h["ip"] for h in mdns("_hap._tcp") if "DIRIGERA" in h["name"].upper()), None)
+
+
+def dig(d, *keys, default=None):
+    """d[k1][k2]... or default when a key is missing or the value is None."""
+    for k in keys:
+        if not isinstance(d, dict) or k not in d:
+            return default
+        d = d[k]
+    return default if d is None else d
+
+
+def deep_merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
+# --- color math ---
+
+GAMUT_C = ((0.6915, 0.3083), (0.17, 0.7), (0.1532, 0.0475))  # Hue color lights (red, green, blue corner)
+
+
+def _gamma(c):
+    return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
+
+def _linear(c):
+    return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+
+
+def xy_to_hs(x, y):
+    """CIE xy (Hue wide-gamut RGB) to (hue 0-360, saturation 0-100) at full brightness."""
+    if y <= 0:
+        return 0.0, 0.0
+    X, Z = x / y, (1 - x - y) / y  # Y = 1
+    rgb = [max(0.0, c) for c in (X * 1.656492 - 0.354851 - Z * 0.255038,
+                                 -X * 0.707196 + 1.655397 + Z * 0.036152,
+                                 X * 0.051713 - 0.121364 + Z * 1.011530)]
+    top = max(rgb) or 1.0
+    h, s, _ = colorsys.rgb_to_hsv(*[_gamma(c / top) for c in rgb])
+    return round(h * 360, 1), round(s * 100, 1)
+
+
+def to_gamut(x, y, tri):
+    """The point (x, y), or the nearest point of the triangle `tri` when it lies outside."""
+    (ax, ay), (bx, by), (cx, cy) = tri
+    d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / d
+    l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / d
+    if l1 >= 0 and l2 >= 0 and l1 + l2 <= 1:
+        return x, y
+    best = None
+    for (px, py), (qx, qy) in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+        dx, dy = qx - px, qy - py
+        t = max(0.0, min(1.0, ((x - px) * dx + (y - py) * dy) / (dx * dx + dy * dy)))
+        c = (px + t * dx, py + t * dy)
+        dist = (c[0] - x) ** 2 + (c[1] - y) ** 2
+        if best is None or dist < best[0]:
+            best = (dist, c)
+    return best[1]
+
+
+def hs_to_xy(h, s, gamut=None):
+    """(hue 0-360, saturation 0-100) to CIE xy, moved into `gamut` (three (x, y) corners) when given."""
+    r, g, b = [_linear(c) for c in colorsys.hsv_to_rgb((h % 360) / 360, max(0.0, min(100.0, s)) / 100, 1)]
+    X = r * 0.664511 + g * 0.154324 + b * 0.162028
+    Y = r * 0.283881 + g * 0.668433 + b * 0.047685
+    Z = r * 0.000088 + g * 0.072310 + b * 0.986039
+    total = (X + Y + Z) or 1.0
+    x, y = X / total, Y / total
+    return to_gamut(x, y, gamut) if gamut else (x, y)
+
+
+def mired(kelvin):
+    return round(1e6 / kelvin)
+
+
+def mired_range(a, b):
+    """(min, max) mireds of a Kelvin range. The order of a and b does not matter."""
+    lo, hi = sorted((a, b))
+    return mired(hi), mired(lo)
+
+
+def mired_to_kelvin(m, a, b):
+    """Kelvin for a mired value, limited to the range a..b (either order)."""
+    lo, hi = sorted((a, b))
+    return max(lo, min(hi, round(1e6 / max(m, 1))))
+
+
+# --- model builders ---
+
+def hchar(s, value, fmt="bool", lo=None, hi=None, step=None, units=None, w=True, valid=None):
+    """A characteristic of the internal model. `valid` lists the allowed values, when not all are."""
+    c = {"type": full(s), "value": value, "format": fmt, "min": lo, "max": hi, "step": step, "units": units,
+         "readable": True, "writable": w}
+    if valid is not None:
+        c["valid"] = valid
+    return c
+
+
+def hsvc(id, name, s, chars):
+    return {"id": id, "name": name, "type": full(s), "primary": True, "chars": chars}
+
+
+def hacc(id, name, room, services, reachable=True):
+    """`room` is a room name here. The hub merges the names into room ids."""
+    return {"id": id, "name": name, "room": room, "reachable": reachable, "services": services}
+
+
+def merge(parts):
+    """[(source, online, {"rooms", "accessories", "scenes", "triggers"})] to one home.
+    Rooms with the same name (any case) from different sources become one room. A source that is
+    offline marks its accessories unreachable."""
+    names, order, accs, scenes, trigs = {}, [], [], [], []
+    rid = lambda n: "room:" + (n or "Other").strip().casefold()
+    for _, online, p in parts:
+        for n in p["rooms"]:
+            names.setdefault(rid(n), (n or "Other").strip())
+            order.append(rid(n))
+        for a in p["accessories"]:
+            r = rid(a["room"])
+            names.setdefault(r, (a["room"] or "Other").strip())
+            order.append(r)
+            accs.append({**a, "room": r, "reachable": a["reachable"] and online})
+        scenes += p["scenes"]
+        trigs += p["triggers"]
+    used = {a["room"] for a in accs}
+    return {"id": "home", "name": "Home", "primary": True, "accessories": accs, "scenes": scenes, "triggers": trigs,
+            "rooms": [{"id": r, "name": names[r]} for r in dict.fromkeys(order) if r in used]}
+
+
+def snap_diff(old, new):
+    """Messages that turn the UI's copy of `old` into `new`: a full snapshot when the structure changed,
+    else char and reach messages."""
+    def flat(snap):
+        h = snap["homes"][0]
+        shape, chars, reach = [], {}, {}
+        for a in h["accessories"]:
+            reach[a["id"]] = a["reachable"]
+            shape.append((a["id"], a["name"], a["room"]))
+            for s in a["services"]:
+                shape.append((s["id"], s["name"], s["type"]))
+                for c in s["chars"]:
+                    shape.append((c["type"], c["min"], c["max"], c["step"], c["writable"], str(c.get("valid"))))
+                    chars[(s["id"], c["type"])] = c["value"]
+        shape += [(r["id"], r["name"]) for r in h["rooms"]] + [(s["id"], s["name"]) for s in h["scenes"]]
+        shape += [(t["id"], t["name"], t["enabled"]) for t in h["triggers"]]
+        return shape, chars, reach
+
+    (s0, c0, r0), (s1, c1, r1) = flat(old), flat(new)
+    if s0 != s1:
+        return [("msg", copy.deepcopy(new))]
+    out = [("msg", {"type": "reach", "accessory": a, "reachable": v}) for a, v in r1.items() if r0[a] != v]
+    out += [("msg", {"type": "char", "service": s, "char": c, "value": v}) for (s, c), v in c1.items() if c0[(s, c)] != v]
+    return out
+
+
+# --- source adapters ---
+
+class Coalescer:
+    """Collects writes per key. Writes to one key within `delay` seconds become one request that carries
+    the latest value of each field (rapid +/- presses end as one write). A worker sends what is due:
+    send({key: fields}) returns {key: ok}. Every submit gets its callback done(ok)."""
+
+    def __init__(self, send, delay=COALESCE):
+        self.send, self.delay, self.pending, self.cv = send, delay, {}, threading.Condition()
         threading.Thread(target=self._run, daemon=True).start()
 
-    def send(self, msg):
-        with self.lock:
-            try:
-                self.sock.sendall(json.dumps(msg).encode() + b"\n")
-                return True
-            except (OSError, AttributeError):
-                return False
+    def submit(self, key, fields, done):
+        with self.cv:
+            item = self.pending.setdefault(key, [{}, [], time.monotonic()])
+            item[0].update(fields)
+            item[1].append(done)
+            self.cv.notify()
 
     def _run(self):
         while True:
+            with self.cv:
+                while True:
+                    due = [k for k, i in self.pending.items() if i[2] + self.delay <= time.monotonic()]
+                    if due:
+                        break
+                    nxt = min((i[2] + self.delay for i in self.pending.values()), default=None)
+                    self.cv.wait(None if nxt is None else max(0.0, nxt - time.monotonic()))
+                items = {k: self.pending.pop(k) for k in due}
             try:
-                with open(BRIDGE_FILE) as f:
-                    info = json.load(f)
-                sock = socket.create_connection(("127.0.0.1", info["port"]), timeout=3)
-            except (OSError, ValueError, KeyError):  # no file, stale file or bridge not running
-                subprocess.run(["open", "-g", "-j", "-a", BRIDGE_APP], capture_output=True)
-                time.sleep(RETRY)
+                got = self.send({k: i[0] for k, i in items.items()})
+            except Exception as error:
+                log(f"write failed: {describe(error)}")
+                got = {}
+            for k, i in items.items():
+                for done in i[1]:
+                    done(bool(got.get(k)))
+
+
+class Source:
+    """One hub. Subclasses fill `refresh` (fetch everything), `stream` (live updates, blocks),
+    `translate` (cache to model parts) and `_flush` (one coalesced write)."""
+
+    name = label = ""
+    delay = COALESCE
+    interval = 0.0  # seconds between two requests of a batch
+
+    def __init__(self, cfg, store):
+        self.cfg, self.store = cfg, store
+        self.online, self.lock = False, threading.RLock()
+        self.notify = lambda: None
+        self.co = Coalescer(self._flush_batch, self.delay)
+
+    def save(self):
+        self.store.put(self.name, self.cfg)
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        wait = RETRY
+        while True:
+            try:
+                self.refresh()
+                self.online, wait = True, RETRY
+                self.notify()
+                while True:  # stream() returns on a harmless timeout and raises on errors
+                    self.stream()
+            except Exception as error:
+                log(f"{self.name}: {describe(error)}")
+            self.online = False
+            self.notify()
+            try:
+                self.relocate()
+            except Exception as error:
+                log(f"{self.name}: {describe(error)}")
+            time.sleep(wait)
+            wait = min(wait * 2, RETRY_MAX)
+
+    def relocate(self):
+        """Find the hub again after a failure (its IP may have changed)."""
+
+    def key_of(self, service):
+        return service.split(":")[1]
+
+    def write(self, service, ch, value, done):
+        """Queue the write of one characteristic. False when the hub is offline."""
+        if not self.online:
+            return False
+        self.co.submit(self.key_of(service), {ch: value}, done)
+        return True
+
+    def run(self, fn, done, *args):
+        def job():
+            try:
+                ok = fn(*args)
+            except Exception as error:
+                log(f"{self.name}: {describe(error)}")
+                ok = False
+            done(ok)
+        threading.Thread(target=job, daemon=True).start()
+
+    def _flush_batch(self, batch):
+        out = {}
+        for key, fields in batch.items():
+            try:
+                out[key] = self._flush(key, fields)
+            except Exception as error:
+                log(f"{self.name}: {describe(error)}")
+                out[key] = False
+            time.sleep(self.interval)
+        return out
+
+    def scene(self, sid):
+        return False
+
+    def trigger(self, sid, enabled):
+        return False
+
+
+class Hue(Source):
+    """Philips Hue Bridge, CLIP API v2 over HTTPS with a pinned certificate, live state by SSE."""
+
+    name, label, interval = "hue", "Hue", HUE_INTERVAL
+
+    def __init__(self, cfg, store):
+        super().__init__(cfg, store)
+        self.res, self.last_group = {}, 0.0  # res: resource type -> id -> resource
+
+    def call(self, method, path, body=None):
+        return hub_call(self.cfg["host"], 443, self.cfg["pin"], method, "/clip/v2" + path, body=body,
+                        headers={"hue-application-key": self.cfg["key"]})
+
+    def refresh(self):
+        st, obj, _ = self.call("GET", "/resource")
+        if st != 200 or not isinstance(obj, dict):
+            raise OSError(f"Hue Bridge answered HTTP {st}")
+        self.load(obj.get("data", []))
+
+    def load(self, data):
+        res = {}
+        for r in data:
+            if isinstance(r, dict) and "id" in r and "type" in r:
+                res.setdefault(r["type"], {})[r["id"]] = r
+        with self.lock:
+            self.res = res
+
+    def relocate(self):
+        hit = find_hue(self.cfg.get("bridge_id"))
+        if hit and hit["host"] != self.cfg["host"]:
+            self.cfg["host"] = hit["host"]
+            self.save()
+
+    def stream(self):
+        conn = https(self.cfg["host"], 443, self.cfg["pin"])
+        try:
+            conn.sock.settimeout(SSE_TIMEOUT)
+            conn.request("GET", "/eventstream/clip/v2",
+                         headers={"hue-application-key": self.cfg["key"], "Accept": "text/event-stream"})
+            r = conn.getresponse()
+            if r.status != 200:
+                raise OSError(f"Hue event stream answered HTTP {r.status}")
+            while True:
+                line = r.readline()
+                if not line:
+                    raise OSError("Hue event stream closed")
+                line = line.decode("utf-8", "replace").strip()
+                if line.startswith("data:"):
+                    try:
+                        events = json.loads(line[5:])
+                    except ValueError:
+                        continue
+                    if self.apply_event(events):
+                        self.refresh()
+                    self.notify()
+        except socket.timeout:
+            return  # no byte for SSE_TIMEOUT: connect again
+        finally:
+            conn.close()
+
+    def apply_event(self, events):
+        """Merge a message of the event stream into the cache. True when everything must be fetched
+        again (a resource was added or deleted)."""
+        again = False
+        with self.lock:
+            for ev in events if isinstance(events, list) else []:
+                if ev.get("type") != "update":
+                    again = again or ev.get("type") in ("add", "delete")
+                    continue
+                for r in ev.get("data", []):
+                    cur = self.res.get(r.get("type"), {}).get(r.get("id"))
+                    if cur is not None:
+                        deep_merge(cur, r)
+        return again
+
+    # --- model ---
+
+    def translate(self):
+        with self.lock:
+            R = self.res
+            g = lambda t: R.get(t, {})
+            place = {}  # device id -> room name. A zone only places lights that no room holds.
+            for z in g("zone").values():
+                for c in z.get("children", []):
+                    dev = dig(g("light").get(c.get("rid"), {}), "owner", "rid")
+                    if dev:
+                        place.setdefault(dev, dig(z, "metadata", "name"))
+            rooms = []
+            for r in g("room").values():
+                n = dig(r, "metadata", "name")
+                rooms.append(n)
+                for c in r.get("children", []):
+                    place[c.get("rid")] = n
+            owned = {}
+            for t in ("light", "motion", "temperature", "light_level", "contact", "device_power", "zigbee_connectivity"):
+                for r in g(t).values():
+                    owned.setdefault(dig(r, "owner", "rid"), []).append((t, r))
+            accs = []
+            for dev in g("device").values():
+                name = dig(dev, "metadata", "name", default=dev["id"])
+                items = owned.get(dev["id"], [])
+                reach = all(r.get("status") == "connected" for t, r in items if t == "zigbee_connectivity")
+                plug = dig(dev, "product_data", "product_archetype") == "plug"
+                svcs = [s for t, r in items for s in self.services(t, r, name, plug)]
+                if any(short(s["type"]) in KINDS for s in svcs):
+                    accs.append(hacc("hue:" + dev["id"], name, place.get(dev["id"]), svcs, reach))
+            raw = [r for t in ("scene", "smart_scene") for r in g(t).values() if dig(r, "metadata", "name")]
+            count = Counter(r["metadata"]["name"] for r in raw)
+            scenes = []
+            for r in raw:
+                n = r["metadata"]["name"]
+                if count[n] > 1:  # same name in several rooms: add the room
+                    grp = R.get(dig(r, "group", "rtype"), {}).get(dig(r, "group", "rid"), {})
+                    n = f"{n}\n{dig(grp, 'metadata', 'name')}" if dig(grp, "metadata", "name") else n
+                scenes.append({"id": "hue:" + r["id"], "name": n, "kind": "custom"})
+            trigs = [{"id": "hue:" + r["id"], "name": r["metadata"]["name"], "enabled": bool(r.get("enabled"))}
+                     for r in g("behavior_instance").values() if dig(r, "metadata", "name")]
+        return {"rooms": [n for n in rooms if n], "accessories": accs, "scenes": scenes, "triggers": trigs}
+
+    def services(self, t, r, name, plug):
+        sid = "hue:" + r["id"]
+        if t == "light":
+            return [self.light_service(sid, r, name, plug)]
+        if t == "motion":
+            v = dig(r, "motion", "motion_report", "motion", default=dig(r, "motion", "motion"))
+            return [hsvc(sid, f"{name} motion", "85", [hchar(MOTION, bool(v), w=False)])]
+        if t == "temperature":
+            v = dig(r, "temperature", "temperature_report", "temperature", default=dig(r, "temperature", "temperature"))
+            return [hsvc(sid, f"{name} temperature", "8A", [hchar(CURT, v, "float", -50, 100, 0.1, "celsius", False)])]
+        if t == "light_level":
+            v = dig(r, "light", "light_level_report", "light_level", default=dig(r, "light", "light_level"))
+            lux = 10 ** ((v - 1) / 10000) if v else 0.0  # Hue sends 10000 * log10(lux) + 1
+            return [hsvc(sid, f"{name} light", "84", [hchar(LUX, round(lux, 1), "float", w=False)])]
+        if t == "contact":
+            state = dig(r, "contact_report", "state")
+            return [hsvc(sid, f"{name} contact", "80", [hchar(CONTACT, 1 if state == "no_contact" else 0, "uint8", w=False)])]
+        if t == "device_power":
+            return [hsvc(sid, f"{name} battery", "96",
+                         [hchar(BATLVL, dig(r, "power_state", "battery_level"), "uint8", 0, 100, 1, "percentage", False)])]
+        return []
+
+    def light_service(self, sid, r, name, plug):
+        chars = [hchar(ON, bool(dig(r, "on", "on", default=False)))]
+        if plug or dig(r, "metadata", "archetype") == "plug":
+            return hsvc(sid, name, "47", chars)
+        if "dimming" in r:
+            b = dig(r, "dimming", "brightness")
+            chars.append(hchar(BRI, None if b is None else round(b), "int", 1, 100, 1, "percentage"))
+        ct = r.get("color_temperature")
+        ct_mode = ct is not None and ct.get("mirek") is not None and ct.get("mirek_valid", True)
+        if "color" in r:  # in color temperature mode the UI shows the white, not the xy of that white
+            xy = dig(r, "color", "xy")
+            h, s = (None, None) if ct_mode or not xy else xy_to_hs(xy["x"], xy["y"])
+            chars += [hchar(HUE, h, "float", 0, 360, 1, "arcdegrees"), hchar(SAT, s, "float", 0, 100, 1, "percentage")]
+        if ct is not None:
+            lo, hi = dig(ct, "mirek_schema", "mirek_minimum", default=153), dig(ct, "mirek_schema", "mirek_maximum", default=500)
+            chars.append(hchar(CT, ct.get("mirek") if ct_mode else None, "uint32", lo, hi, 1))
+        return hsvc(sid, name, "43", chars)
+
+    # --- writes ---
+
+    def light_body(self, lid, f):
+        """Request body of PUT /resource/light/{id} for the fields {char: value}, or None."""
+        with self.lock:
+            r = self.res.get("light", {}).get(lid)
+        if r is None:
+            return None
+        body = {}
+        if ON in f:
+            body["on"] = {"on": bool(f[ON])}
+        if BRI in f:
+            body["dimming"] = {"brightness": float(max(1, min(100, f[BRI])))}
+        if HUE in f or SAT in f:  # one color: the half that is not written comes from the light
+            xy = dig(r, "color", "xy")
+            cur = xy_to_hs(xy["x"], xy["y"]) if xy else (0.0, 0.0)
+            x, y = hs_to_xy(f.get(HUE, cur[0]), f.get(SAT, cur[1]), gamut_of(r))
+            body["color"] = {"xy": {"x": round(x, 4), "y": round(y, 4)}}
+        elif CT in f:
+            lo = dig(r, "color_temperature", "mirek_schema", "mirek_minimum", default=153)
+            hi = dig(r, "color_temperature", "mirek_schema", "mirek_maximum", default=500)
+            body["color_temperature"] = {"mirek": int(max(lo, min(hi, f[CT])))}
+        return body
+
+    def groups(self):
+        """[(grouped_light id, reachable light ids)]: the whole home first, then each room."""
+        R, out = self.res, []
+        lights = {lid: dig(light, "owner", "rid") for lid, light in R.get("light", {}).items()}
+        bad = {dig(z, "owner", "rid") for z in R.get("zigbee_connectivity", {}).values() if z.get("status") != "connected"}
+        gid = lambda res: next((s["rid"] for s in res.get("services", []) if s.get("rtype") == "grouped_light"), None)
+        home = next(iter(R.get("bridge_home", {}).values()), None)
+        if home and gid(home):
+            out.append((gid(home), {lid for lid, o in lights.items() if o not in bad}))
+        for room in R.get("room", {}).values():
+            kids = {c.get("rid") for c in room.get("children", [])}
+            if gid(room):
+                out.append((gid(room), {lid for lid, o in lights.items() if o in kids and o not in bad}))
+        return out
+
+    def _flush_batch(self, batch):
+        """One grouped_light write replaces the writes to all lights of a room (or of the home) when the
+        batch only sets on/off, to the same value, on every reachable light of the group. The rest goes
+        light by light. Hue allows about 10 light and 1 group command per second."""
+        out, left = {}, dict(batch)
+        with self.lock:
+            groups = self.groups()
+        for gid, members in groups:
+            if not members or not members.issubset(left):
                 continue
+            vals = {left[k].get(ON) if list(left[k]) == [ON] else None for k in members}
+            if len(vals) != 1 or None in vals:
+                continue
+            time.sleep(max(0.0, self.last_group + HUE_GROUP_INTERVAL - time.monotonic()))
+            self.last_group = time.monotonic()
             try:
-                self.sock = sock
-                sock.sendall(json.dumps({"op": "hello", "token": info["token"]}).encode() + b"\n")
-                reader = sock.makefile("rb")
-                hello = parse(reader.readline())
-                if not hello or not hello.get("ok"):
-                    raise OSError("bridge refused the token")
-                sock.settimeout(None)
-                self.connected = True
-                self.events.put(("conn", True))
-                for line in reader:
-                    if (msg := parse(line)) is not None:
-                        self.events.put(("msg", msg))
-            except OSError as error:
-                print(f"Bridge connection lost: {error}", flush=True)
-            finally:
-                self.connected = False
-                self.events.put(("conn", False))
-                sock.close()
-            time.sleep(RETRY)
+                ok = ok_resp(*self.call("PUT", f"/resource/grouped_light/{gid}", {"on": {"on": bool(vals.pop())}})[:2])
+            except Exception as error:
+                log(f"hue: {describe(error)}")
+                ok = False
+            for k in members:
+                out[k] = ok
+                left.pop(k)
+        for k, f in left.items():
+            try:
+                out[k] = self._flush(k, f)
+            except Exception as error:
+                log(f"hue: {describe(error)}")
+                out[k] = False
+            time.sleep(self.interval)
+        return out
+
+    def _flush(self, lid, f):
+        body = self.light_body(lid, f)
+        return bool(body) and ok_resp(*self.call("PUT", f"/resource/light/{lid}", body)[:2])
+
+    def scene(self, sid):
+        rid = sid.split(":", 1)[1]
+        smart = rid in self.res.get("smart_scene", {})
+        action = {"recall": {"action": "activate" if smart else "active"}}
+        return ok_resp(*self.call("PUT", f"/resource/{'smart_scene' if smart else 'scene'}/{rid}", action)[:2])
+
+    def trigger(self, sid, enabled):
+        rid = sid.split(":", 1)[1]
+        return ok_resp(*self.call("PUT", f"/resource/behavior_instance/{rid}", {"enabled": bool(enabled)})[:2])
+
+
+def gamut_of(light):
+    g = dig(light, "color", "gamut")
+    try:
+        return tuple((g[k]["x"], g[k]["y"]) for k in ("red", "green", "blue")) if g else None
+    except (KeyError, TypeError):
+        return None
+
+
+def fan_mode(active, speed):
+    """DIRIGERA fanMode for the purifier's on/off and speed (unverified names)."""
+    if active == 0 or speed == 0:
+        return "off"
+    if speed:
+        return "low" if speed <= 25 else "medium" if speed <= 50 else "high"
+    return "auto"
+
+
+class Ikea(Source):
+    """IKEA DIRIGERA, local REST API on port 8443 with a pinned certificate, live state by WebSocket.
+    Attribute names below follow the public API as other clients use it; those marked unverified are guesses."""
+
+    name, label, interval = "ikea", "IKEA", IKEA_INTERVAL
+    PORT = 8443
+
+    def __init__(self, cfg, store):
+        super().__init__(cfg, store)
+        self.dev, self.scn = {}, {}
+
+    def call(self, method, path, body=None):
+        return hub_call(self.cfg["host"], self.PORT, self.cfg["pin"], method, "/v1" + path, body=body,
+                        headers={"Authorization": "Bearer " + self.cfg["token"]})
+
+    def refresh(self):
+        st, devs, _ = self.call("GET", "/devices")
+        if st != 200 or not isinstance(devs, list):
+            raise OSError(f"DIRIGERA answered HTTP {st}")
+        st, scn, _ = self.call("GET", "/scenes")
+        scn = scn if st == 200 and isinstance(scn, list) else []
+        self.load(devs, scn)
+
+    def load(self, devs, scn):
+        with self.lock:
+            self.dev = {d["id"]: d for d in devs if isinstance(d, dict) and "id" in d}
+            self.scn = {s["id"]: s for s in scn if isinstance(s, dict) and "id" in s}
+
+    def relocate(self):
+        ip = find_ikea()
+        if ip and ip != self.cfg["host"]:
+            self.cfg["host"] = ip
+            self.save()
+
+    def stream(self):
+        import websocket
+        sock = pinned_socket(self.cfg["host"], self.PORT, self.cfg["pin"])  # checked before the token is sent
+        ws = websocket.WebSocket()
+        try:
+            ws.connect(f"wss://{self.cfg['host']}:{self.PORT}/v1", socket=sock,
+                       header=["Authorization: Bearer " + self.cfg["token"]])
+            ws.settimeout(WS_PING)
+            while True:
+                try:
+                    msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    ws.ping()
+                    continue
+                if not msg:
+                    raise OSError("DIRIGERA WebSocket closed")
+                try:
+                    ev = json.loads(msg)
+                except ValueError:
+                    continue
+                if self.apply_event(ev):
+                    self.refresh()
+                self.notify()
+        finally:
+            ws.close()
+
+    def apply_event(self, ev):
+        """Merge a WebSocket message into the cache. True when everything must be fetched again."""
+        if not isinstance(ev, dict):
+            return False
+        d = ev.get("data")
+        with self.lock:
+            if ev.get("type") == "deviceStateChanged" and isinstance(d, dict) and d.get("id") in self.dev:
+                deep_merge(self.dev[d["id"]], d)
+                return False
+        return ev.get("type") in ("deviceAdded", "deviceRemoved", "sceneCreated", "sceneUpdated", "sceneDeleted")
+
+    # --- model ---
+
+    @staticmethod
+    def pos(level):
+        """HAP position (100 = open) from a DIRIGERA blinds level."""
+        return None if level is None else 100 - level if IKEA_BLINDS_INVERTED else level
+
+    def translate(self):
+        with self.lock:
+            devs, scn = list(self.dev.values()), list(self.scn.values())
+        accs, rooms = [], []
+        for d in devs:
+            a = d.get("attributes") or {}
+            kind, did = d.get("deviceType"), d["id"]
+            name = a.get("customName") or a.get("model") or did
+            room = dig(d, "room", "name")
+            if room:
+                rooms.append(room)
+            sv = lambda suffix, s, chars, label="": hsvc(f"ikea:{did}:{suffix}", f"{name} {label}".strip(), s, chars)
+            svcs = []
+            if kind == "light":
+                chars = [hchar(ON, bool(a.get("isOn")))]
+                ct_mode = a.get("colorMode") != "color"
+                if "lightLevel" in a:
+                    chars.append(hchar(BRI, a["lightLevel"], "int", 1, 100, 1, "percentage"))
+                if "colorHue" in a and "colorSaturation" in a:
+                    chars += [hchar(HUE, None if ct_mode else a["colorHue"], "float", 0, 360, 1, "arcdegrees"),
+                              hchar(SAT, None if ct_mode else round(a["colorSaturation"] * 100, 1), "float", 0, 100, 1, "percentage")]
+                if "colorTemperature" in a:
+                    # IKEA names the warmest value "Max" and the coolest "Min": sort, so that the order does not matter
+                    lo, hi = mired_range(a.get("colorTemperatureMin", 4000), a.get("colorTemperatureMax", 2202))
+                    chars.append(hchar(CT, mired(a["colorTemperature"]) if ct_mode else None, "uint32", lo, hi, 1))
+                svcs.append(sv("light", "43", chars))
+            elif kind == "outlet":
+                svcs.append(sv("outlet", "47", [hchar(ON, bool(a.get("isOn")))]))
+            elif kind == "blinds":
+                svcs.append(sv("blinds", "8C", [hchar(POSC, self.pos(a.get("blindsCurrentLevel")), "uint8", 0, 100, 1, "percentage", False),
+                                                hchar(POST, self.pos(a.get("blindsTargetLevel")), "uint8", 0, 100, 1, "percentage")]))
+            elif kind == "airPurifier":
+                mode = a.get("fanMode")  # off, low, medium, high, auto (unverified)
+                speed = {"off": 0, "low": 25, "medium": 50, "high": 100}.get(mode)
+                svcs.append(sv("purifier", "BB", [hchar(ACTIVE, 0 if mode in (None, "off") else 1, "uint8", 0, 1, 1),
+                                                  hchar(SPEED, speed, "float", 0, 100, 25, "percentage")]))
+                if "currentPM25" in a:
+                    svcs.append(sv("pm25", "8D", [hchar(PM25, a["currentPM25"], "float", w=False)], "PM2.5"))
+            elif kind == "motionSensor":
+                svcs.append(sv("motion", "85", [hchar(MOTION, bool(a.get("isDetected")), w=False)]))
+            elif kind == "openCloseSensor":
+                svcs.append(sv("contact", "80", [hchar(CONTACT, 1 if a.get("isOpen") else 0, "uint8", w=False)]))
+            elif kind == "environmentSensor":
+                if "currentTemperature" in a:
+                    svcs.append(sv("temp", "8A", [hchar(CURT, a["currentTemperature"], "float", -50, 100, 0.1, "celsius", False)], "temperature"))
+                if "currentRH" in a:
+                    svcs.append(sv("rh", "82", [hchar(HUM, a["currentRH"], "float", 0, 100, 1, "percentage", False)], "humidity"))
+                if "currentPM25" in a:
+                    svcs.append(sv("pm25", "8D", [hchar(PM25, a["currentPM25"], "float", w=False)], "PM2.5"))
+            elif kind == "waterSensor":  # attribute name unverified
+                svcs.append(sv("leak", "83", [hchar(LEAK, 1 if a.get("waterLeakDetected") else 0, "uint8", w=False)]))
+            if svcs and a.get("batteryPercentage") is not None:
+                svcs.append(sv("battery", "96", [hchar(BATLVL, a["batteryPercentage"], "uint8", 0, 100, 1, "percentage", False)], "battery"))
+            if svcs:
+                accs.append(hacc("ikea:" + did, name, room, svcs, d.get("isReachable", True)))
+        scenes = [{"id": "ikea:" + s["id"], "name": dig(s, "info", "name") or s.get("name") or s["id"], "kind": "custom"} for s in scn]
+        return {"rooms": rooms, "accessories": accs, "scenes": scenes, "triggers": []}
+
+    # --- writes ---
+
+    def body(self, did, f):
+        """Request body of PATCH /v1/devices/{id} for the fields {char: value}, or None."""
+        with self.lock:
+            d = self.dev.get(did)
+        if d is None:
+            return None
+        a, out = d.get("attributes") or {}, {}
+        if ON in f:
+            out["isOn"] = bool(f[ON])
+        if BRI in f:
+            out["lightLevel"] = int(max(1, min(100, round(f[BRI]))))
+        if HUE in f or SAT in f:  # both together: the half that is not written comes from the light
+            out["colorHue"] = round(float(f.get(HUE, a.get("colorHue", 0))) % 360, 1)
+            out["colorSaturation"] = round(max(0.0, min(100.0, f.get(SAT, a.get("colorSaturation", 0) * 100))) / 100, 3)
+        elif CT in f:
+            out["colorTemperature"] = mired_to_kelvin(f[CT], a.get("colorTemperatureMin", 4000), a.get("colorTemperatureMax", 2202))
+        if POST in f:
+            p = int(max(0, min(100, round(f[POST]))))
+            out["blindsTargetLevel"] = 100 - p if IKEA_BLINDS_INVERTED else p
+        if ACTIVE in f or SPEED in f:
+            out["fanMode"] = fan_mode(f.get(ACTIVE), f.get(SPEED))
+        return [{"attributes": out}] if out else None
+
+    def _flush(self, did, f):
+        body = self.body(did, f)
+        return bool(body) and ok_resp(*self.call("PATCH", f"/devices/{did}", body)[:2])
+
+    def scene(self, sid):
+        return ok_resp(*self.call("POST", f"/scenes/{sid.split(':', 1)[1]}/trigger")[:2])
+
+
+class RateLimited(OSError):
+    pass
+
+
+def tado_mode(state):
+    """(mode, target) of a zone state: mode 0 off, 1 heat (manual overlay), 3 auto (schedule)."""
+    target = dig(state, "setting", "temperature", "celsius")
+    if dig(state, "setting", "power") == "OFF":
+        return 0, target
+    return (1 if state.get("overlay") else 3), target
+
+
+class Tado(Source):
+    """tado, cloud API. Free accounts get about 100 requests per day, so it polls every TADO_POLL seconds,
+    refreshes once after a write and stops for the Retry-After time after HTTP 429."""
+
+    name, label, delay = "tado", "tado", TADO_COALESCE
+    HOST = "my.tado.com"
+
+    def __init__(self, cfg, store):
+        super().__init__(cfg, store)
+        self.zones, self.states, self.access, self.expires, self.blocked = [], {}, None, 0.0, 0.0
+
+    def token(self):
+        """Access token. Refresh tokens rotate: the new one is saved at once."""
+        with self.lock:
+            if self.access and time.time() < self.expires - 30:
+                return self.access
+            st, obj, _ = cloud_call("login.tado.com", "POST", "/oauth2/token", form={
+                "client_id": TADO_CLIENT, "grant_type": "refresh_token", "refresh_token": self.cfg["refresh_token"]})
+            if st != 200 or not isinstance(obj, dict) or "access_token" not in obj:
+                raise OSError(f"tado refused the login (HTTP {st}): pair tado again if this stays")
+            self.cfg["refresh_token"] = obj.get("refresh_token", self.cfg["refresh_token"])
+            self.save()
+            self.access, self.expires = obj["access_token"], time.time() + obj.get("expires_in", 600)
+            return self.access
+
+    def api(self, method, path, body=None):
+        if time.time() < self.blocked:
+            raise RateLimited("tado rate limit: waiting")
+        st, obj, headers = cloud_call(self.HOST, method, "/api/v2" + path, body=body,
+                                      headers={"Authorization": "Bearer " + self.token()})
+        if st == 429:
+            try:
+                wait = float(headers.get("Retry-After") or "")
+            except ValueError:
+                wait = TADO_RATE_WAIT
+            self.blocked = time.time() + wait
+            raise RateLimited(f"tado answered HTTP 429: no requests for {wait / 60:.0f} minutes")
+        return st, obj
+
+    def refresh(self):
+        hid = self.cfg["home_id"]
+        try:
+            if not self.zones:
+                st, zones = self.api("GET", f"/homes/{hid}/zones")
+                if st != 200 or not isinstance(zones, list):
+                    raise OSError(f"tado answered HTTP {st}")
+                self.zones = zones
+            st, obj = self.api("GET", f"/homes/{hid}/zoneStates")
+            if st != 200 or not isinstance(obj, dict):
+                raise OSError(f"tado answered HTTP {st}")
+            with self.lock:
+                self.states = obj.get("zoneStates", {})
+        except RateLimited:
+            if not self.states:
+                raise  # nothing to show yet; otherwise keep the last state
+
+    def stream(self):
+        while True:
+            time.sleep(TADO_POLL)
+            self.refresh()
+            self.notify()
+
+    def key_of(self, service):
+        return ":".join(service.split(":")[1:3])
+
+    def translate(self):
+        with self.lock:
+            zones, states = list(self.zones), dict(self.states)
+        hid, accs = self.cfg["home_id"], []
+        for z in zones:
+            s = states.get(str(z.get("id")))
+            if z.get("type") != "HEATING" or not s:
+                continue
+            mode, target = tado_mode(s)
+            cur = dig(s, "sensorDataPoints", "insideTemperature", "celsius")
+            hum = dig(s, "sensorDataPoints", "humidity", "percentage")
+            heating = (dig(s, "activityDataPoints", "heatingPower", "percentage", default=0) or 0) > 0
+            chars = [hchar(CURT, cur, "float", -50, 100, 0.1, "celsius", False),
+                     hchar(TARGT, target, "float", 5, 25, 0.5, "celsius"),
+                     hchar(CURMODE, 1 if heating else 0, "uint8", 0, 2, 1, w=False),
+                     hchar(TARMODE, mode, "uint8", 0, 3, 1, valid=[0, 1, 3])]  # tado has no cooling in a heating zone
+            if hum is not None:
+                chars.append(hchar(HUM, hum, "float", 0, 100, 1, "percentage", False))
+            aid, name = f"tado:{hid}:{z['id']}", f"{z.get('name', 'Zone')} heating"
+            accs.append(hacc(aid, name, z.get("name"), [hsvc(aid + ":th", name, "4A", chars)],
+                             dig(s, "link", "state", default="ONLINE") == "ONLINE"))
+        return {"rooms": [], "accessories": accs, "scenes": [], "triggers": []}
+
+    def overlay(self, key, f):
+        """(method, path, body) for the fields {char: value} of one zone. Auto removes the overlay."""
+        hid, zid = key.split(":")
+        mode0, target0 = tado_mode(self.states.get(zid) or {})
+        mode = f.get(TARMODE, 1 if TARGT in f else mode0)  # a new target means manual heat
+        path = f"/homes/{hid}/zones/{zid}/overlay"
+        if mode == 3:
+            return "DELETE", path, None
+        setting = {"type": "HEATING", "power": "OFF"} if mode == 0 else {
+            "type": "HEATING", "power": "ON", "temperature": {"celsius": float(f.get(TARGT, target0 or TADO_DEFAULT_TARGET))}}
+        return "PUT", path, {"setting": setting, "termination": dict(TADO_TERMINATION)}
+
+    def _flush(self, key, f):
+        method, path, body = self.overlay(key, f)
+        st, _ = self.api(method, path, body)
+        if st == 422 and body:  # tado names the end of an overlay in more than one way: try "until changed" once
+            body["termination"] = dict(TADO_TERMINATION_FALLBACK)
+            st, _ = self.api(method, path, body)
+        ok = st in (200, 201, 202, 204)
+        if ok:
+            try:
+                self.refresh()  # one refresh after each write
+                self.notify()
+            except Exception as error:
+                log(f"tado: {describe(error)}")
+        return ok
+
+
+SOURCES = {"hue": Hue, "ikea": Ikea, "tado": Tado}
+
+
+class Hub:
+    """The link of the UI for real hubs: runs the sources, merges them into one home and sends changes as
+    snapshot, char and reach messages. Writes go to the source that owns the id prefix."""
+
+    def __init__(self, events, sources):
+        self.events, self.sources = events, sources
+        self.by_name = {s.name: s for s in sources}
+        self.lock, self.last, self.was = threading.Lock(), None, False
+        for s in sources:
+            s.notify = self.update
+
+    @property
+    def connected(self):
+        return any(s.online for s in self.sources)
+
+    @property
+    def offline(self):
+        """Text of key 0 when no hub answers: which hubs are down."""
+        if not self.sources:
+            return "No hub\npaired"
+        return "Offline:\n" + " ".join(s.label for s in self.sources)
+
+    def start(self):
+        for s in self.sources:
+            s.start()
+
+    def snapshot(self):
+        return {"type": "snapshot", "homes": [merge([(s.name, s.online, s.translate()) for s in self.sources])]}
+
+    def update(self):
+        """A source changed: send what differs from the last state."""
+        with self.lock:
+            new = self.snapshot()
+            msgs = [("msg", copy.deepcopy(new))] if self.last is None else snap_diff(self.last, new)
+            self.last = new
+            for m in msgs:
+                self.events.put(m)
+            if self.connected != self.was:
+                self.was = self.connected
+                self.events.put(("conn", self.was))
+
+    def send(self, msg):
+        op = msg.get("op")
+        if op == "snapshot":
+            self.events.put(("msg", self.snapshot()))
+            return True
+        sid = str(msg.get("service") or msg.get("id"))
+        src = self.by_name.get(sid.partition(":")[0])
+        if src is None or not src.online:
+            return False
+        done = lambda ok: self.events.put(("msg", {"type": "result", "req": msg.get("req"), "ok": bool(ok)}))
+        if op == "write":
+            return src.write(msg["service"], short(msg["char"]), msg["value"], done)
+        if op == "scene":
+            src.run(src.scene, done, sid)
+        elif op == "trigger":
+            src.run(src.trigger, done, sid, msg["enabled"])
+        else:
+            return False
+        return True
 
 
 def fake_snapshot():
-    def ch(s, value, fmt="bool", lo=None, hi=None, step=None, units=None, w=True):
-        return {"type": full(s), "value": value, "format": fmt, "min": lo, "max": hi, "step": step, "units": units,
-                "readable": True, "writable": w}
-
-    def sv(id, name, s, chars):
-        return {"id": id, "name": name, "type": full(s), "primary": True, "chars": chars}
-
-    def ac(id, name, room, services, reachable=True):
-        return {"id": id, "name": name, "room": room, "reachable": reachable, "services": services}
+    ch, sv, ac = hchar, hsvc, hacc
 
     def light(id, name, room, on, bri, color=None, ct=None, reachable=True):
         chars = [ch(ON, on), ch(BRI, bri, "int", 0, 100, 1, "percentage")]
@@ -1047,7 +2297,13 @@ def serve(demo=False):
     from StreamDeck.Transport.Transport import TransportError
 
     events = queue.Queue()
-    link = (FakeBridge if demo else Link)(events)
+    if demo:
+        link = FakeBridge(events)
+    else:
+        store = Creds()
+        link = Hub(events, [cls(cfg, store) for name, cls in SOURCES.items() if (cfg := store.get(name))])
+        if not link.sources:
+            log("No hub is paired. Run: stream-deck-home pair hue|ikea|tado")
     link.start()
     waiting_printed = False
     try:
@@ -1091,10 +2347,304 @@ def label(keys):
     return [k.label.replace("\n", " ") for k in keys]
 
 
+HUE_GAMUT = {"red": {"x": 0.6915, "y": 0.3083}, "green": {"x": 0.17, "y": 0.7}, "blue": {"x": 0.1532, "y": 0.0475}}
+
+
+def hue_sample():
+    """Resources as GET /clip/v2/resource returns them (trimmed to the fields we read)."""
+    own = lambda d: {"rid": d, "rtype": "device"}
+    zig = lambda i, d, status="connected": {"id": i, "type": "zigbee_connectivity", "owner": own(d), "status": status}
+    dev = lambda i, name, arch="sultan_bulb": {"id": i, "type": "device", "metadata": {"name": name}, "product_data": {"product_archetype": arch}}
+    return [
+        dev("d1", "Floor lamp"),
+        {"id": "l1", "type": "light", "owner": own("d1"), "metadata": {"name": "Floor lamp"}, "on": {"on": True},
+         "dimming": {"brightness": 54.3, "min_dim_level": 0.2},
+         "color_temperature": {"mirek": None, "mirek_valid": False, "mirek_schema": {"mirek_minimum": 153, "mirek_maximum": 500}},
+         "color": {"xy": {"x": 0.4, "y": 0.45}, "gamut": HUE_GAMUT, "gamut_type": "C"}}, zig("z1", "d1"),
+        dev("d5", "Hall lamp"),
+        {"id": "l5", "type": "light", "owner": own("d5"), "metadata": {"name": "Hall lamp"}, "on": {"on": True},
+         "dimming": {"brightness": 100}}, zig("z5", "d5"),
+        dev("d3", "TV plug", "plug"),
+        {"id": "l3", "type": "light", "owner": own("d3"), "metadata": {"name": "TV plug", "archetype": "plug"}, "on": {"on": False}},
+        zig("z3", "d3", "connectivity_issue"),
+        dev("d2", "Hall sensor", "unknown_archetype"),
+        {"id": "m1", "type": "motion", "owner": own("d2"), "motion": {"motion_report": {"motion": True}}},
+        {"id": "t1", "type": "temperature", "owner": own("d2"), "temperature": {"temperature_report": {"temperature": 19.25}}},
+        {"id": "ll1", "type": "light_level", "owner": own("d2"), "light": {"light_level_report": {"light_level": 20001}}},
+        {"id": "p1", "type": "device_power", "owner": own("d2"), "power_state": {"battery_state": "low", "battery_level": 12}},
+        zig("z2", "d2"),
+        dev("d4", "Door sensor"),
+        {"id": "c1", "type": "contact", "owner": own("d4"), "contact_report": {"state": "no_contact"}}, zig("z4", "d4"),
+        {"id": "r1", "type": "room", "metadata": {"name": "Living Room"}, "children": [own("d1"), own("d3")],
+         "services": [{"rid": "g1", "rtype": "grouped_light"}]},
+        {"id": "r2", "type": "room", "metadata": {"name": "Hall"}, "children": [own("d2"), own("d4"), own("d5")],
+         "services": [{"rid": "g2", "rtype": "grouped_light"}]},
+        {"id": "bh", "type": "bridge_home", "services": [{"rid": "gh", "rtype": "grouped_light"}]},
+        {"id": "s1", "type": "scene", "metadata": {"name": "Relax"}, "group": {"rid": "r1", "rtype": "room"}},
+        {"id": "s2", "type": "scene", "metadata": {"name": "Relax"}, "group": {"rid": "r2", "rtype": "room"}},
+        {"id": "ss1", "type": "smart_scene", "metadata": {"name": "Wake up"}, "group": {"rid": "r2", "rtype": "room"}},
+        {"id": "b1", "type": "behavior_instance", "enabled": True, "metadata": {"name": "Sunset"}},
+        {"id": "b2", "type": "behavior_instance", "enabled": False, "metadata": {"name": "Away"}},
+        {"id": "x1", "type": "bridge", "owner": own("d1")},  # unknown types are ignored
+    ]
+
+
+IKEA_DEVICES = [
+    {"id": "i1", "deviceType": "light", "isReachable": True, "room": {"id": "x", "name": "living room"},
+     "attributes": {"customName": "Ceiling", "isOn": True, "lightLevel": 70, "colorTemperature": 2700,
+                    "colorTemperatureMin": 4000, "colorTemperatureMax": 2202, "colorMode": "temperature",
+                    "colorHue": 30.0, "colorSaturation": 0.5}},
+    {"id": "i2", "deviceType": "blinds", "isReachable": True, "room": {"name": "Bedroom"},
+     "attributes": {"customName": "Blind", "blindsCurrentLevel": 20, "blindsTargetLevel": 20, "batteryPercentage": 15}},
+    {"id": "i3", "deviceType": "environmentSensor", "isReachable": True, "room": {"name": "Bedroom"},
+     "attributes": {"customName": "Air", "currentTemperature": 21.5, "currentRH": 40, "currentPM25": 7}},
+    {"id": "i4", "deviceType": "airPurifier", "isReachable": True, "room": {"name": "Bedroom"},
+     "attributes": {"customName": "Purifier", "fanMode": "medium", "currentPM25": 3}},
+    {"id": "i5", "deviceType": "outlet", "isReachable": False, "room": {"name": "Bedroom"}, "attributes": {"customName": "Lamp plug", "isOn": False}},
+    {"id": "i6", "deviceType": "motionSensor", "room": {"name": "Bedroom"}, "attributes": {"customName": "Motion", "isDetected": False}},
+    {"id": "i7", "deviceType": "openCloseSensor", "room": {"name": "Bedroom"}, "attributes": {"customName": "Window", "isOpen": True}},
+    {"id": "i8", "deviceType": "waterSensor", "room": {"name": "Bedroom"}, "attributes": {"customName": "Leak", "waterLeakDetected": False}},
+    {"id": "i9", "deviceType": "gateway", "attributes": {"customName": "Hub"}},  # unknown device types are ignored
+    {"id": "i10", "deviceType": "newThing", "attributes": {"surprise": [1, 2]}},
+]
+TADO_ZONES = [{"id": 1, "name": "Living Room", "type": "HEATING"}, {"id": 0, "name": "Hot water", "type": "HOT_WATER"}]
+
+
+def tado_states():
+    return {"1": {"setting": {"type": "HEATING", "power": "ON", "temperature": {"celsius": 21.0}}, "overlay": None,
+                  "link": {"state": "ONLINE"}, "sensorDataPoints": {"insideTemperature": {"celsius": 20.44}, "humidity": {"percentage": 48.2}},
+                  "activityDataPoints": {"heatingPower": {"percentage": 40}}},
+            "0": {"setting": {"type": "HOT_WATER", "power": "ON"}}}
+
+
+def drain(events):
+    out = []
+    while not events.empty():
+        out.append(events.get_nowait())
+    return out
+
+
+def test_hubs():
+    # credentials: mode 0600 in a folder with mode 0700, atomic, no wider mode survives a load
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "conf", "credentials.json")
+        store = Creds(path)
+        store.put("hue", {"key": "secret"})
+        store.put("ikea", {"token": "t"})
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600" and oct(os.stat(os.path.dirname(path)).st_mode & 0o777) == "0o700"
+        os.chmod(path, 0o644)
+        assert store.get("hue") == {"key": "secret"} and os.stat(path).st_mode & 0o777 == 0o600
+        store.put("hue", None)
+        assert store.get("hue") is None and store.get("ikea") == {"token": "t"} and not os.listdir(os.path.dirname(path)) == []
+        try:
+            pinned_socket("127.0.0.1", 9, None)  # no pin and no first_use: refused before any connection
+            raise AssertionError("expected PinError")
+        except PinError:
+            pass
+        # color math
+        for h, s in ((30, 60), (120, 50), (200, 40), (280, 45), (60, 70)):
+            x, y = hs_to_xy(h, s, GAMUT_C)
+            h2, s2 = xy_to_hs(x, y)
+            assert abs((h2 - h + 180) % 360 - 180) < 4 and abs(s2 - s) < 6, (h, s, h2, s2)
+        red, red_c = hs_to_xy(0, 100), hs_to_xy(0, 100, GAMUT_C)
+        assert red != red_c and to_gamut(*red_c, GAMUT_C) == red_c  # a color outside the gamut moves in
+        assert to_gamut(0.3, 0.3, GAMUT_C) == (0.3, 0.3) and xy_to_hs(0.3, 0.0) == (0.0, 0.0)
+        assert mired_range(4000, 2202) == mired_range(2202, 4000) == (250, 454) and mired(2700) == 370
+        assert mired_to_kelvin(154, 2202, 4000) == 4000 and mired_to_kelvin(900, 4000, 2202) == 2202 and mired_to_kelvin(370, 2202, 4000) == 2703
+        assert pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        # discovery output of dns-sd
+        browse = "14:27:52.330  Add        2  13 local.               _hue._tcp.           Hue Bridge - 123456\n"
+        assert parse_browse(browse) == ["Hue Bridge - 123456"]
+        look = ("14:27:56.438  Hue\\032Bridge._hue._tcp.local. can be reached at 001788123456.local.:443 (interface 13)\n"
+                " bridgeid=001788fffe123456 modelid=BSB002\n")
+        assert parse_lookup(look) == ("001788123456.local", 443, {"bridgeid": "001788fffe123456", "modelid": "BSB002"})
+        assert parse_lookup("nothing") is None
+        # Hue: translation
+        hue = Hue({"host": "h", "pin": "p", "key": "k"}, store)
+        hue.load(hue_sample())
+        hue.interval = 0
+        t = hue.translate()
+        by = {a["name"]: a for a in t["accessories"]}
+        assert t["rooms"] == ["Living Room", "Hall"] and set(by) == {"Floor lamp", "Hall lamp", "TV plug", "Hall sensor", "Door sensor"}, set(by)
+        chars = lambda a, s: {short(c["type"]): c for c in a["services"][s]["chars"]}
+        lamp = chars(by["Floor lamp"], 0)
+        assert by["Floor lamp"]["id"] == "hue:d1" and by["Floor lamp"]["services"][0]["id"] == "hue:l1" and by["Floor lamp"]["room"] == "Living Room"
+        assert lamp[ON]["value"] is True and lamp[BRI]["value"] == 54 and lamp[CT]["value"] is None and (lamp[CT]["min"], lamp[CT]["max"]) == (153, 500)
+        assert 50 < lamp[HUE]["value"] < 100 and lamp[SAT]["value"] > 30
+        assert by["Hall lamp"]["services"][0]["chars"][1]["value"] == 100 and len(by["Hall lamp"]["services"][0]["chars"]) == 2
+        assert short(by["TV plug"]["services"][0]["type"]) == "47" and by["TV plug"]["reachable"] is False and by["Floor lamp"]["reachable"] is True
+        kinds = {short(s["type"]): {short(c["type"]): c["value"] for c in s["chars"]} for s in by["Hall sensor"]["services"]}
+        assert kinds["85"] == {MOTION: True} and kinds["8A"] == {CURT: 19.25} and kinds["84"][LUX] == 100.0 and kinds["96"] == {BATLVL: 12}
+        assert {short(c["type"]): c["value"] for c in by["Door sensor"]["services"][0]["chars"]} == {CONTACT: 1}
+        assert [s["name"] for s in t["scenes"]] == ["Relax\nLiving Room", "Relax\nHall", "Wake up"] and t["scenes"][0]["id"] == "hue:s1"
+        assert t["triggers"] == [{"id": "hue:b1", "name": "Sunset", "enabled": True}, {"id": "hue:b2", "name": "Away", "enabled": False}]
+        # Hue: write translation, ct mode, gamut, group writes
+        assert hue.light_body("l1", {ON: True, BRI: 30}) == {"on": {"on": True}, "dimming": {"brightness": 30.0}}
+        assert hue.light_body("l1", {BRI: 0})["dimming"]["brightness"] == 1.0 and hue.light_body("l1", {CT: 100}) == {"color_temperature": {"mirek": 153}}
+        body = hue.light_body("l1", {HUE: 0, SAT: 100})["color"]["xy"]
+        assert to_gamut(body["x"], body["y"], GAMUT_C) == (body["x"], body["y"]) and hue.light_body("nope", {ON: True}) is None
+        assert hue.light_body("l1", {HUE: 200})["color"]["xy"] == hue.light_body("l1", {HUE: 200, SAT: xy_to_hs(0.4, 0.45)[1]})["color"]["xy"]
+        calls = []
+        hue.call = lambda method, path, body=None: (calls.append((method, path, body)) or (200, {"data": [], "errors": []}, None))
+        globals()["HUE_GROUP_INTERVAL"] = 0
+        off = lambda ids, **extra: {i: {ON: False, **extra} for i in ids}
+        assert hue._flush_batch(off(["l1", "l5"])) == {"l1": True, "l5": True} and calls == [("PUT", "/resource/grouped_light/gh", {"on": {"on": False}})]
+        calls.clear()  # not every light of the home: the room group of the Living Room (the plug is unreachable)
+        hue._flush_batch(off(["l1"]))
+        assert calls == [("PUT", "/resource/grouped_light/g1", {"on": {"on": False}})]
+        calls.clear()  # more than on/off: light by light
+        hue._flush_batch(off(["l1", "l5"], **{BRI: 5}))
+        assert [c[1] for c in calls] == ["/resource/light/l1", "/resource/light/l5"]
+        calls.clear()  # different values: light by light
+        hue._flush_batch({"l1": {ON: False}, "l5": {ON: True}})
+        assert [c[1] for c in calls] == ["/resource/grouped_light/g1", "/resource/grouped_light/g2"]
+        # Hue: event stream message to char updates (deep merge keeps the gamut)
+        events = queue.Queue()
+        hub = Hub(events, [hue])
+        hue.online = True
+        hub.update()
+        first = drain(events)
+        assert first[0][1]["type"] == "snapshot" and first[1] == ("conn", True)
+        again = hue.apply_event([{"id": "e", "type": "update", "data": [
+            {"id": "l1", "type": "light", "on": {"on": False}, "dimming": {"brightness": 20}, "color": {"xy": {"x": 0.3, "y": 0.3}}},
+            {"id": "m1", "type": "motion", "motion": {"motion_report": {"motion": False}}}, {"id": "zzz", "type": "bridge"}]}])
+        hub.update()
+        got = {(m[1]["service"], short(m[1]["char"])): m[1]["value"] for m in drain(events)}
+        assert again is False and got[("hue:l1", ON)] is False and got[("hue:l1", BRI)] == 20 and got[("hue:m1", MOTION)] is False
+        assert gamut_of(hue.res["light"]["l1"]) == GAMUT_C[0:1] + GAMUT_C[1:2] + GAMUT_C[2:3]
+        assert hue.apply_event([{"type": "add", "data": []}]) is True and hue.apply_event("junk") is False
+        # IKEA
+        ikea = Ikea({"host": "i", "pin": "p", "token": "k"}, store)
+        ikea.load(IKEA_DEVICES, [{"id": "sc1", "info": {"name": "Evening"}}])
+        t = ikea.translate()
+        by = {a["name"]: a for a in t["accessories"]}
+        assert set(by) == {"Ceiling", "Blind", "Air", "Purifier", "Lamp plug", "Motion", "Window", "Leak"}, set(by)
+        ch = lambda a, s: {short(c["type"]): c for c in a["services"][s]["chars"]}
+        c = ch(by["Ceiling"], 0)
+        assert (c[CT]["min"], c[CT]["max"], c[CT]["value"]) == (250, 454, 370) and c[HUE]["value"] is None and c[BRI]["value"] == 70
+        assert by["Ceiling"]["room"] == "living room" and by["Ceiling"]["services"][0]["id"] == "ikea:i1:light"
+        assert ch(by["Blind"], 0)[POSC]["value"] == (80 if IKEA_BLINDS_INVERTED else 20) and by["Blind"]["services"][1]["chars"][0]["value"] == 15
+        assert [short(s["type"]) for s in by["Air"]["services"]] == ["8A", "82", "8D"] and ch(by["Air"], 2)[PM25]["value"] == 7
+        assert (ch(by["Purifier"], 0)[ACTIVE]["value"], ch(by["Purifier"], 0)[SPEED]["value"]) == (1, 50)
+        assert by["Lamp plug"]["reachable"] is False and ch(by["Window"], 0)[CONTACT]["value"] == 1 and ch(by["Leak"], 0)[LEAK]["value"] == 0
+        assert t["scenes"] == [{"id": "ikea:sc1", "name": "Evening", "kind": "custom"}] and ikea.key_of("ikea:i1:light") == "i1"
+        attr = lambda f, d="i1": ikea.body(d, f)[0]["attributes"]
+        assert attr({ON: False, BRI: 150}) == {"isOn": False, "lightLevel": 100} and attr({CT: 154})["colorTemperature"] == 4000
+        assert attr({CT: 900})["colorTemperature"] == 2202 and attr({HUE: 400, SAT: 60}) == {"colorHue": 40.0, "colorSaturation": 0.6}
+        assert attr({SAT: 100}) == {"colorHue": 30.0, "colorSaturation": 1.0}
+        assert attr({POST: 100}, "i2") == {"blindsTargetLevel": 0 if IKEA_BLINDS_INVERTED else 100}
+        assert attr({ACTIVE: 0}, "i4") == {"fanMode": "off"} and attr({SPEED: 75}, "i4") == {"fanMode": "high"} and attr({ACTIVE: 1}, "i4") == {"fanMode": "auto"}
+        assert ikea.body("nope", {ON: True}) is None and ikea.body("i1", {}) is None
+        # IKEA: WebSocket message to char updates; unknown events and devices do not break anything
+        events = queue.Queue()
+        hub = Hub(events, [ikea])
+        ikea.online = True
+        hub.update()
+        drain(events)
+        assert ikea.apply_event({"type": "deviceStateChanged", "data": {"id": "i1", "attributes": {"isOn": False, "lightLevel": 10}}}) is False
+        assert ikea.apply_event({"type": "deviceStateChanged", "data": {"id": "unknown", "attributes": {}}}) is False
+        assert ikea.apply_event({"type": "deviceAdded", "data": {}}) is True and ikea.apply_event(["junk"]) is False and ikea.apply_event({"type": "pong"}) is False
+        hub.update()
+        got = {(m[1]["service"], short(m[1]["char"])): m[1]["value"] for m in drain(events)}
+        assert got == {("ikea:i1:light", ON): False, ("ikea:i1:light", BRI): 10}, got
+        # tado
+        tado = Tado({"home_id": 123, "refresh_token": "r"}, store)
+        tado.zones, tado.states = TADO_ZONES, tado_states()
+        t = tado.translate()
+        a = t["accessories"][0]
+        c = {short(x["type"]): x for x in a["services"][0]["chars"]}
+        assert len(t["accessories"]) == 1 and a["id"] == "tado:123:1" and a["room"] == "Living Room" and short(a["services"][0]["type"]) == "4A"
+        assert (c[CURT]["value"], c[TARGT]["value"], c[HUM]["value"], c[CURMODE]["value"], c[TARMODE]["value"]) == (20.44, 21.0, 48.2, 1, 3)
+        assert c[TARMODE]["valid"] == [0, 1, 3] and (c[TARGT]["min"], c[TARGT]["max"], c[TARGT]["step"]) == (5, 25, 0.5)
+        path = "/homes/123/zones/1/overlay"
+        assert tado.key_of("tado:123:1:th") == "123:1"
+        assert tado.overlay("123:1", {TARGT: 22.5}) == ("PUT", path, {"setting": {"type": "HEATING", "power": "ON", "temperature": {"celsius": 22.5}}, "termination": {"type": "TADO_MODE"}})
+        assert tado.overlay("123:1", {TARMODE: 3, TARGT: 22}) == ("DELETE", path, None)
+        assert tado.overlay("123:1", {TARMODE: 0})[2]["setting"] == {"type": "HEATING", "power": "OFF"}
+        assert tado.overlay("123:1", {TARMODE: 1})[2]["setting"]["temperature"] == {"celsius": 21.0}
+        tado.states["1"]["setting"] = {"type": "HEATING", "power": "OFF"}
+        tado.states["1"]["overlay"] = {"type": "MANUAL"}
+        assert tado.overlay("123:1", {TARMODE: 1})[2]["setting"]["temperature"] == {"celsius": TADO_DEFAULT_TARGET}
+        assert tado.translate()["accessories"][0]["services"][0]["chars"][3]["value"] == 0
+        tado.states["1"]["setting"] = {"type": "HEATING", "power": "ON", "temperature": {"celsius": 19.0}}
+        assert tado.translate()["accessories"][0]["services"][0]["chars"][3]["value"] == 1
+        tado.states["1"]["link"] = {"state": "OFFLINE"}
+        assert tado.translate()["accessories"][0]["reachable"] is False
+        tado.blocked = time.time() + 100  # after HTTP 429 no request goes out, the last state stays
+        try:
+            tado.api("GET", "/x")
+            raise AssertionError("expected RateLimited")
+        except RateLimited:
+            pass
+        tado.refresh()
+        tado.blocked = 0
+        # thermostat detail page shows only the modes tado supports
+        ui = UI(Stub(), 0.0)
+        ui.on_msg({"type": "snapshot", "homes": [merge([("tado", True, tado.translate())])]}, 0.0)
+        ui.stack = [("home", 0), ("detail", "tado:123:1:th", 0)]
+        assert label(ui.keys(0)[:9]) == ["Back", "Now", "-0.5", "Target", "+0.5", "Off", "Heat", "Auto", "Humidity"], label(ui.keys(0)[:9])
+        # three sources: rooms with the same name merge, an offline source marks its devices unreachable
+        tado.states = tado_states()
+        events = queue.Queue()
+        hub = Hub(events, [hue, ikea, tado])
+        for s in hub.sources:
+            s.online = True
+        home = hub.snapshot()["homes"][0]
+        assert [r["name"] for r in home["rooms"]] == ["Living Room", "Hall", "Bedroom"], home["rooms"]
+        living = {a["name"] for a in home["accessories"] if a["room"] == "room:living room"}
+        assert living == {"Floor lamp", "TV plug", "Ceiling", "Living Room heating"}, living
+        assert all(a["reachable"] for a in home["accessories"] if a["id"].startswith("ikea:i1"))
+        assert hub.connected and hub.offline == "Offline:\nHue IKEA tado"
+        ikea.online = False
+        hub.update()
+        drain(events)
+        assert not any(a["reachable"] for a in hub.snapshot()["homes"][0]["accessories"] if a["id"].startswith("ikea:")) and hub.connected
+        hue.online = tado.online = False
+        hub.update()
+        assert drain(events)[-1] == ("conn", False) and not hub.connected
+        assert Hub(events, []).offline == "No hub\npaired"
+        # a trigger or scene change is a structure change: full snapshot
+        old = hub.snapshot()
+        new = copy.deepcopy(old)
+        new["homes"][0]["triggers"][0]["enabled"] = False
+        assert snap_diff(old, new)[0][1]["type"] == "snapshot" and snap_diff(old, old) == []
+        # writes through the hub: routing, coalescing (hue + sat in one request), results
+        events = queue.Queue()
+        calls.clear()
+        hub = Hub(events, [hue, ikea])
+        hue.online = True
+        ikea.online = False
+        assert hub.send({"op": "write", "service": "hue:l1", "char": full(HUE), "value": 120, "req": 1})
+        assert hub.send({"op": "write", "service": "hue:l1", "char": full(SAT), "value": 50, "req": 2})
+        assert hub.send({"op": "write", "service": "hue:l1", "char": full(BRI), "value": 40, "req": 3})
+        assert not hub.send({"op": "write", "service": "ikea:i1:light", "char": full(ON), "value": True, "req": 4})  # offline
+        assert not hub.send({"op": "write", "service": "other:1", "char": full(ON), "value": True, "req": 5})
+        time.sleep(0.5)
+        assert len(calls) == 1 and calls[0][0] == "PUT" and calls[0][1] == "/resource/light/l1" and set(calls[0][2]) == {"color", "dimming"}, calls
+        assert sorted((m[1]["req"], m[1]["ok"]) for m in drain(events)) == [(1, True), (2, True), (3, True)]
+        hub.send({"op": "scene", "service": None, "id": "hue:s1", "req": 6})
+        hub.send({"op": "trigger", "id": "hue:b1", "enabled": False, "req": 7})
+        time.sleep(0.3)
+        assert calls[1:] == [("PUT", "/resource/scene/s1", {"recall": {"action": "active"}}),
+                             ("PUT", "/resource/behavior_instance/b1", {"enabled": False})] or calls[1:] == [
+            ("PUT", "/resource/behavior_instance/b1", {"enabled": False}), ("PUT", "/resource/scene/s1", {"recall": {"action": "active"}})]
+        hub.send({"op": "scene", "id": "hue:ss1", "req": 8})
+        time.sleep(0.2)
+        assert ("PUT", "/resource/smart_scene/ss1", {"recall": {"action": "activate"}}) in calls
+        # coalescer: rapid repeats become one request with the latest value
+        seen = []
+        co = Coalescer(lambda batch: (seen.append(dict(batch)) or {k: True for k in batch}), 0.1)
+        results = []
+        for v in (10, 20, 30, 40):
+            co.submit("k", {BRI: v}, results.append)
+        co.submit("k2", {ON: True}, results.append)
+        time.sleep(0.4)
+        assert seen == [{"k": {BRI: 40}, "k2": {ON: True}}] and results == [True] * 5, (seen, results)
+
+
 def test():
-    # protocol and UUIDs
-    assert parse(b'{"type":"char","value":1}') == {"type": "char", "value": 1}
-    assert parse(b"nope") is None and parse(b"[1]") is None
+    test_hubs()
+    # UUIDs
     assert short("0000004A-0000-1000-8000-0026BB765291") == "4A" and short("0000000E-0000-1000-8000-0026BB765291") == "E"
     assert short("ABCD1234-0000-0000-0000-000000000000") == "ABCD1234-0000-0000-0000-000000000000"
     assert full("4A") == "0000004A-0000-1000-8000-0026BB765291" and short(full("B7")) == "B7"
@@ -1109,7 +2659,7 @@ def test():
     # home page
     ui = test_ui()
     k = ui.keys(0)
-    assert len(k) == 15 and k[0].label == "Home\n4 on" and k[0].tap is None  # floor, ceiling, counter, desk
+    assert len(k) == 15 and (k[0].label, k[0].sub) == ("Home", "4 on") and k[0].tap is None  # floor, ceiling, counter, desk
     assert label(k[1:5]) == ["Scenes", "Status", "Automations", "All lights off"]
     assert k[2].badge == "2" and k[2].fill == RED  # unreachable lamp + low battery contact
     assert label(k[5:10]) == ["Living Room", "Kitchen", "Bedroom", "Office", "Hallway"] and k[10] == EMPTY
@@ -1119,7 +2669,7 @@ def test():
     assert UI(Stub(), 0).keys(0)[1:] == [EMPTY] * 14 and ui.keys(0)[0].glyph == "home"
     off = UI(Stub(), 0)
     off.connected = False
-    assert off.keys(0)[0].label == "Bridge\noffline"
+    assert off.keys(0)[0].label == "Offline"
     # paging of rooms: 12 rooms -> 9 per page and a page key
     big = fake_snapshot()
     big["homes"][0]["rooms"] = [{"id": f"r{i}", "name": f"Room {i}"} for i in range(12)]
@@ -1205,7 +2755,7 @@ def test():
     ui3.handle(("msg", {"type": "reach", "accessory": "acc-ceiling", "reachable": False}), 9)
     assert ui3.model.val("ceiling", BRI) == 42 and not ui3.model.reachable("acc-ceiling")
     ui3.handle(("conn", False), 10)  # lost connection reverts pending writes
-    assert not ui3.pending and ui3.keys(10)[0].label == "Bridge\noffline"
+    assert not ui3.pending and ui3.keys(10)[0].label == "Offline"
     # snapshot push keeps the page, drops vanished rooms
     ui3.handle(("conn", True), 11)
     ui3.stack = [("home", 0), ("room", "office", 0)]
@@ -1346,8 +2896,9 @@ def test():
     shots.append(base.keys(0))
     for keys in shots:
         assert len(keys) == 15
-        img = sheet(keys)
-        assert img.size == (5 * 72 + 32, 3 * 72 + 16)
+        for theme in THEMES:  # every page in every theme
+            img = sheet(keys, theme=theme)
+            assert img.size == (5 * 72 + 32, 3 * 72 + 16)
     # the fake bridge answers: snapshot, write with failure, scene failure
     events = queue.Queue()
     fake = FakeBridge(events)
@@ -1367,10 +2918,176 @@ def shots(out="/tmp"):
                        ("lights2", ("detail", "floor", 1)), ("thermostat", ("detail", "thermo", 0)),
                        ("status", ("status", 0)), ("hall", ("room", "hall", 0))):
         ui.stack = [("home", 0), page] if name != "home" else [page]
-        sheet(ui.keys(0)).save(f"{out}/homedeck-{name}.png")
+        keys = ui.keys(0)
+        sheet(keys).save(f"{out}/homedeck-{name}.png")  # the selected theme
         print(f"{out}/homedeck-{name}.png")
+        if name in ("home", "room"):
+            for theme in THEMES:
+                sheet(keys, theme=theme).save(f"{out}/homedeck-{theme}-{name}.png")
+                print(f"{out}/homedeck-{theme}-{name}.png")
+
+
+# --- pairing and status ---
+
+def hostname():
+    return socket.gethostname().split(".")[0] or "mac"
+
+
+def pkce_challenge(verifier):
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+def pair_hue(host=None):
+    found = None
+    if host is None:
+        print("Looking for a Hue Bridge on the network...")
+        found = find_hue()
+        if not found:
+            sys.exit("No Hue Bridge found. Run the command again with --host <ip>.")
+        host = found["host"]
+        print(f"Found the Hue Bridge at {host}.")
+    print("Press the round link button on the Hue Bridge now. Waiting up to 60 seconds...")
+    pin, key, deadline = None, None, time.time() + PAIR_SECONDS
+    while key is None:
+        conn = https(host, 443, pin, first_use=pin is None)  # later attempts must see the same certificate
+        pin = conn.pin
+        try:
+            st, obj, _ = request(conn, "POST", "/api", body={
+                "devicetype": f"stream-deck-home#{hostname()[:19]}", "generateclientkey": True})
+        finally:
+            conn.close()
+        item = obj[0] if isinstance(obj, list) and obj and isinstance(obj[0], dict) else {}
+        if "success" in item:
+            key = item["success"]["username"]
+        elif dig(item, "error", "type") != 101:  # 101 = link button not pressed yet
+            sys.exit(f"The Hue Bridge refused the pairing: {dig(item, 'error', 'description', default=f'HTTP {st}')}")
+        elif time.time() >= deadline:
+            sys.exit("The link button was not pressed in time. Run the command again.")
+        else:
+            time.sleep(PAIR_STEP)
+    _, cfg, _ = hub_call(host, 443, pin, "GET", "/api/config")
+    bridge_id = str(dig(cfg, "bridgeid", default="")).upper()
+    if found and found["bridge_id"] and bridge_id and found["bridge_id"] != bridge_id:
+        sys.exit("The bridge id differs from the one announced on the network. Nothing was saved.")
+    Creds().put("hue", {"host": host, "bridge_id": bridge_id, "pin": pin, "key": key})
+    print(f"Paired with the Hue Bridge {bridge_id or host}. Its certificate is pinned.")
+
+
+def pair_ikea(host=None):
+    if host is None:
+        print("Looking for a DIRIGERA hub on the network...")
+        host = find_ikea()
+        if not host:
+            sys.exit("No DIRIGERA hub found. Run the command again with --host <ip>.")
+        print(f"Found the DIRIGERA hub at {host}.")
+    verifier = secrets.token_urlsafe(96)  # 128 characters
+    query = urllib.parse.urlencode({"audience": "homesmart.local", "response_type": "code",
+                                    "code_challenge": pkce_challenge(verifier), "code_challenge_method": "S256"})
+    conn = https(host, 8443, None, first_use=True)
+    pin = conn.pin
+    try:
+        _, obj, _ = request(conn, "GET", f"/v1/oauth/authorize?{query}")
+    finally:
+        conn.close()
+    code = dig(obj, "code")
+    if not code:
+        sys.exit("The DIRIGERA hub gave no pairing code.")
+    print("Press the action button on the DIRIGERA hub now. Waiting up to 60 seconds...")
+    deadline = time.time() + PAIR_SECONDS
+    while True:
+        st, obj, _ = hub_call(host, 8443, pin, "POST", "/v1/oauth/token", form={
+            "code": code, "name": hostname(), "grant_type": "authorization_code", "code_verifier": verifier})
+        if dig(obj, "access_token"):
+            break
+        if time.time() >= deadline:
+            sys.exit("The action button was not pressed in time. Run the command again.")
+        time.sleep(PAIR_STEP)
+    Creds().put("ikea", {"host": host, "pin": pin, "token": obj["access_token"]})
+    print(f"Paired with the DIRIGERA hub at {host}. Its certificate is pinned.")
+
+
+def pair_tado(host=None):
+    st, obj, _ = cloud_call("login.tado.com", "POST", "/oauth2/device_authorize",
+                            form={"client_id": TADO_CLIENT, "scope": "offline_access"})
+    if st != 200 or not dig(obj, "device_code"):
+        sys.exit(f"tado refused the login (HTTP {st}).")
+    url = obj.get("verification_uri_complete") or obj["verification_uri"]
+    print(f"Open this address, log in to tado and confirm the code {obj.get('user_code', '')}:\n  {url}")
+    if url.startswith("https://login.tado.com/"):
+        subprocess.run(["open", url], capture_output=True)
+    wait, deadline = obj.get("interval", 5), time.time() + obj.get("expires_in", 300)
+    while True:
+        time.sleep(wait)
+        st, tok, _ = cloud_call("login.tado.com", "POST", "/oauth2/token", form={
+            "client_id": TADO_CLIENT, "device_code": obj["device_code"],
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+        if st == 200 and dig(tok, "refresh_token"):
+            break
+        error = dig(tok, "error")
+        if error == "slow_down":
+            wait += 5
+        elif error != "authorization_pending" or time.time() >= deadline:
+            sys.exit("The tado login was not confirmed in time. Run the command again.")
+    _, me, _ = cloud_call("my.tado.com", "GET", "/api/v2/me", headers={"Authorization": "Bearer " + tok["access_token"]})
+    homes = dig(me, "homes", default=[])
+    if not homes:
+        sys.exit("This tado account has no home.")
+    if len(homes) > 1:
+        print(f"The account has {len(homes)} homes. Using the first: {homes[0].get('name', homes[0]['id'])}.")
+    Creds().put("tado", {"refresh_token": tok["refresh_token"], "home_id": homes[0]["id"]})
+    print("Paired with tado.")
+
+
+PAIR = {"hue": pair_hue, "ikea": pair_ikea, "tado": pair_tado}
+
+
+def status():
+    store = Creds()
+    for name, cls in SOURCES.items():
+        cfg = store.get(name)
+        if not cfg:
+            print(f"{name:5} not paired")
+            continue
+        try:
+            src = cls(cfg, store)
+            src.refresh()
+            t = src.translate()
+            rooms = {a["room"] for a in t["accessories"] if a["room"]}
+            print(f"{name:5} paired, reachable: {len(rooms)} rooms, {len(t['accessories'])} devices, {len(t['scenes'])} scenes")
+        except Exception as error:
+            print(f"{name:5} paired, not reachable ({describe(error)})")
+
+
+def unpair(name):
+    store = Creds()
+    print(f"Forgot {name}." if store.get(name) else f"{name} was not paired.")
+    store.put(name, None)
+    print("The access key stays on the hub until you remove it there (see the README).")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="stream-deck-home", description="Stream Deck control deck for Hue, DIRIGERA and tado.")
+    p.add_argument("--theme", choices=THEMES, help="key look (default graphite, or STREAM_DECK_HOME_THEME)")
+    sub = p.add_subparsers(dest="cmd")
+    for name, text in (("serve", "run the deck (default)"), ("demo", "run the deck on a fake home"),
+                       ("test", "self-check without hardware"), ("status", "paired hubs and counts")):
+        sub.add_parser(name, help=text)
+    sh = sub.add_parser("shots", help="write PNG renders to a folder (default /tmp)")
+    sh.add_argument("folder", nargs="?", default="/tmp")
+    pr = sub.add_parser("pair", help="pair a hub")
+    pr.add_argument("source", choices=SOURCES)
+    pr.add_argument("--host", help="IP address of the hub, when discovery fails")
+    up = sub.add_parser("unpair", help="forget the credentials of a hub")
+    up.add_argument("source", choices=SOURCES)
+    args = p.parse_args(argv)
+    global THEME
+    THEME = args.theme or os.environ.get("STREAM_DECK_HOME_THEME") or THEME
+    if THEME not in THEMES:
+        sys.exit(f"Unknown theme {THEME!r}. Use one of: {', '.join(THEMES)}.")
+    {"serve": serve, "demo": lambda: serve(True), "test": test, "status": status, None: serve,
+     "shots": lambda: shots(args.folder), "pair": lambda: PAIR[args.source](args.host),
+     "unpair": lambda: unpair(args.source)}[args.cmd]()
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
-    {"serve": serve, "demo": lambda: serve(True), "test": test, "shots": lambda: shots(*sys.argv[2:3])}[cmd]()
+    main()

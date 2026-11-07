@@ -1,0 +1,117 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  body{margin:0;font-family:-apple-system,"SF Pro Text",Helvetica,sans-serif;color:var(--foreground,#222)}
+  h2{font-size:15px;margin:18px 0 2px}
+  p{margin:0 0 8px;font-size:12px;color:var(--muted-foreground,#666)}
+  .row{display:flex;gap:18px;flex-wrap:wrap}
+  .deck{background:#050506;padding:9px;border-radius:14px;display:grid;grid-template-columns:repeat(5,60px);gap:7px}
+  .k{width:60px;height:60px;border-radius:9px;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:9.5px;line-height:1.1;text-align:center;font-weight:600}
+  .k svg{width:22px;height:22px;margin-bottom:4px}
+  .big{font-size:15px;font-weight:700;margin-bottom:3px}
+  .bar{position:absolute;left:8px;right:8px;bottom:4px;height:3px;border-radius:2px;background:rgba(255,255,255,.18)}
+  .bar i{display:block;height:100%;border-radius:2px}
+  .badge{position:absolute;top:4px;right:6px;font-size:10px;font-weight:800}
+  .cap{font-size:11px;color:var(--muted-foreground,#666);margin-top:4px}
+</style></head><body>
+<div id="out"></div>
+<script>
+// Mockup of the three key themes of deck.py (graphite, vivid, neon). The rules in themes[...].key(k)
+// are ported to PIL in deck.py (paint). Open this file in a browser.
+const I={
+ home:'<path d="M3 11 12 4l9 7v9h-6v-6H9v6H3z"/>',
+ play:'<path d="M7 4v16l13-8z"/>',
+ info:'<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.2"/><rect x="11" y="10" width="2.2" height="7"/><rect x="11" y="6" width="2.2" height="2.2"/>',
+ clock:'<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M11 6h2v6l4 2-1 2-5-3z"/>',
+ power:'<path d="M11 2h2v10h-2z"/><path d="M6.3 5.6 7.7 7a7 7 0 1 0 8.6 0l1.4-1.4A9 9 0 1 1 6.3 5.6z"/>',
+ bulb:'<path d="M12 2a7 7 0 0 0-4 12.7V18h8v-3.3A7 7 0 0 0 12 2z"/><rect x="9" y="19" width="6" height="2.5" rx="1"/>',
+ plug:'<path d="M8 2h2v5H8zm6 0h2v5h-2zM6 8h12v4a6 6 0 0 1-5 5.9V22h-2v-4.1A6 6 0 0 1 6 12z"/>',
+ blinds:'<path d="M3 3h18v2H3zm1 3h16v2.5H4zm0 3.5h16V12H4zm0 3.5h16v2.5H4z"/><rect x="11" y="16" width="2" height="5"/>',
+ thermo:'<path d="M10 3a2 2 0 0 1 4 0v10.3a4.5 4.5 0 1 1-4 0z"/>',
+ back:'<path d="M10 5 3 12l7 7v-5h11v-4H10z"/>',
+ sensor:'<circle cx="12" cy="12" r="3"/><path d="M12 4a8 8 0 0 1 8 8h-2a6 6 0 0 0-6-6zm0 4a4 4 0 0 1 4 4h-2a2 2 0 0 0-2-2z" />',
+ lock:'<path d="M7 10V7a5 5 0 0 1 10 0v3h1v11H6V10zm2 0h6V7a3 3 0 0 0-6 0z"/>'
+};
+const svg=n=>`<svg viewBox="0 0 24 24" fill="currentColor">${I[n]}</svg>`;
+// key model: kind, label, icon, on, color (light rgb), level, big, badge, alert
+const home=[
+ {k:'nav',icon:'home',label:'Home',big:'4 on',cat:'home'},
+ {k:'nav',icon:'play',label:'Scenes',cat:'scenes'},
+ {k:'nav',icon:'info',label:'Status',cat:'alert',badge:'2'},
+ {k:'nav',icon:'clock',label:'Automations',cat:'auto'},
+ {k:'nav',icon:'power',label:'All off',cat:'off'},
+ {k:'room',label:'Living Room',big:'5/5',on:1,color:[255,170,90],hue:28},
+ {k:'room',label:'Kitchen',big:'1/3',on:1,color:[255,214,150],hue:45},
+ {k:'room',label:'Bedroom',big:'0/4',on:0,hue:265},
+ {k:'room',label:'Office',big:'1/1',on:1,color:[120,170,255],hue:215},
+ {k:'room',label:'Hallway',big:'0/3',on:0,hue:160},
+ {k:'climate',icon:'thermo',label:'Climate',big:'21.5°',on:1},
+ {k:'empty'},{k:'empty'},{k:'empty'},{k:'empty'}];
+const room=[
+ {k:'nav',icon:'back',label:'Back',cat:'back'},
+ {k:'nav',icon:'power',label:'Room off',cat:'off'},
+ {k:'light',icon:'bulb',label:'Floor lamp',on:1,color:[255,168,80],level:80},
+ {k:'light',icon:'bulb',label:'Hue Go',on:1,color:[170,80,255],level:60},
+ {k:'light',icon:'bulb',label:'Ceiling',on:1,color:[255,244,225],level:100},
+ {k:'light',icon:'bulb',label:'TV strip',on:1,color:[0,210,230],level:40},
+ {k:'light',icon:'bulb',label:'Shelf lamp',on:0,level:0},
+ {k:'dev',icon:'plug',label:'Speaker',on:1,devcolor:[52,199,89]},
+ {k:'dev',icon:'blinds',label:'Blinds 60%',on:1,devcolor:[90,200,250],level:60},
+ {k:'climate',icon:'thermo',label:'→ 22°',big:'21.5°',on:1},
+ {k:'sensor',icon:'sensor',label:'48 % RH',big:'22.1°'},
+ {k:'dev',icon:'lock',label:'Front door',on:1,devcolor:[48,209,88],cap:'Locked'},
+ {k:'light',icon:'bulb',label:'Desk lamp',offline:1},
+ {k:'empty'},{k:'empty'}];
+
+const rgb=(c,a=1)=>`rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const CAT={home:[255,159,10],scenes:[255,55,95],alert:[255,69,58],auto:[10,132,255],off:[142,142,147],back:[142,142,147]};
+
+const themes={
+ 'A · Graphite Glow':{note:'Dark graphite keys. A device that is on glows from the bottom in its real light color; the icon takes that color. Off devices go quiet. Calm, Apple-Home-at-night look.',
+  key(k){const base='background:linear-gradient(#22252c,#14161b);color:#8b919c;';
+   if(k.offline)return {s:base+'color:#555a63',badge:'!',bc:'#ff9f0a'};
+   if(k.k==='nav'){const c=CAT[k.cat];return {s:base+`color:${rgb(c)}`,txt:'#d8dbe0'}}
+   if(k.k==='room'){return k.on?{s:`background:radial-gradient(120% 90% at 50% 120%,${rgb(k.color,.85)},#1a1c22 70%);color:#fff`}:{s:base}}
+   if(k.k==='climate')return {s:`background:radial-gradient(120% 90% at 50% 120%,rgba(255,120,60,.8),#1a1c22 70%);color:#fff`};
+   if(k.k==='sensor')return {s:base+'color:#64d2ff',txt:'#d8dbe0'};
+   if(k.on){const c=k.color||k.devcolor;return {s:`background:radial-gradient(130% 100% at 50% 125%,${rgb(c,.25+.6*(k.level??80)/100)},#16181d 75%);color:${rgb(c)}`,txt:'#fff',bar:c}}
+   return {s:base+'color:#4d525b'};
+  }},
+ 'B · Vivid Tiles':{note:'Every key is a saturated two-tone gradient, like iOS Shortcuts tiles. Each room keeps its own hue; lights fill with their real color. Readable from across the room on the LCD.',
+  key(k){
+   const g=(h,s=80,l=52)=>`linear-gradient(145deg,hsl(${h} ${s}% ${l+8}%),hsl(${h+18} ${s}% ${l-14}%))`;
+   const off='background:#1c1c1e;color:#6e6e73;';
+   if(k.offline)return {s:off,badge:'!',bc:'#ff453a'};
+   if(k.k==='nav'){const H={home:30,scenes:330,alert:2,auto:212,off:0,back:0}[k.cat];return {s:(k.cat==='off'||k.cat==='back')?'background:linear-gradient(145deg,#48484a,#2c2c2e);color:#fff':`background:${g(H)};color:#fff`}}
+   if(k.k==='room')return k.on?{s:`background:${g(k.hue)};color:#fff`}:{s:`background:linear-gradient(145deg,hsl(${k.hue} 25% 22%),hsl(${k.hue} 25% 12%));color:hsl(${k.hue} 40% 70%)`};
+   if(k.k==='climate')return {s:`background:${g(18,90,55)};color:#fff`};
+   if(k.k==='sensor')return {s:`background:${g(190,70,40)};color:#fff`};
+   if(k.on){const c=k.color||k.devcolor;const dark=c[0]*.3+c[1]*.59+c[2]*.11>170;return {s:`background:linear-gradient(145deg,${rgb(c)},${rgb(c.map(v=>v*.55))});color:${dark?'#1c1c1e':'#fff'}`,bar:dark?[28,28,30]:[255,255,255]}}
+   return {s:off};
+  }},
+ 'C · Neon Line':{note:'Near-black keys with a thin colored ring. On = glowing ring and a colored label; off = a dim outline. Strong contrast, minimal light spill in a dark room.',
+  key(k){const base='background:#0b0b0d;color:#5a5a60;box-shadow:inset 0 0 0 1.5px #2a2a2e;';
+   const ring=c=>`background:radial-gradient(90% 90% at 50% 50%,${rgb(c,.14)},#0b0b0d);color:${rgb(c)};box-shadow:inset 0 0 0 2px ${rgb(c)},inset 0 0 14px ${rgb(c,.45)};`;
+   if(k.offline)return {s:base,badge:'!',bc:'#ff453a'};
+   if(k.k==='nav')return {s:ring(CAT[k.cat]),txt:'#e5e5ea'};
+   if(k.k==='room')return k.on?{s:ring(k.color),txt:'#fff'}:{s:base};
+   if(k.k==='climate')return {s:ring([255,120,60]),txt:'#fff'};
+   if(k.k==='sensor')return {s:ring([100,210,255]),txt:'#fff'};
+   if(k.on){const c=k.color||k.devcolor;return {s:ring(c),txt:'#fff',bar:c}}
+   return {s:base};
+  }}
+};
+function deck(keys,t){return '<div class="deck">'+keys.map(k=>{
+  if(k.k==='empty')return '<div class="k" style="background:#0e0e10"></div>';
+  const r=t.key(k);const txt=r.txt?`color:${r.txt}`:'';
+  let h=k.icon&&!k.big?svg(k.icon):'';
+  if(k.big)h=`<div class="big">${k.big}</div>`;
+  if(k.icon&&k.big&&k.k!=='climate'&&k.k!=='sensor'&&k.k!=='nav')h=svg(k.icon)+h;
+  if(k.k==='nav'&&k.big)h=svg(k.icon);
+  h+=`<div style="${txt}">${k.k==='nav'&&k.big?k.label+' · '+k.big:(k.cap||k.label)}</div>`;
+  if(k.badge||r.badge)h+=`<div class="badge" style="color:${r.bc||'#fff'}">${k.badge||r.badge}</div>`;
+  if(r.bar&&k.level)h+=`<div class="bar"><i style="width:${k.level}%;background:${rgb(r.bar)}"></i></div>`;
+  return `<div class="k" style="${r.s}">${h}</div>`}).join('')+'</div>'}
+document.getElementById('out').innerHTML=Object.entries(themes).map(([n,t])=>
+ `<h2>${n}</h2><p>${t.note}</p><div class="row"><div>${deck(home,t)}<div class="cap">Home page</div></div><div>${deck(room,t)}<div class="cap">Living Room</div></div></div>`).join('');
+</script></body></html>
