@@ -11,9 +11,10 @@ It talks to the hubs directly, like Home Assistant does. It does not use Apple H
 | Philips Hue Bridge | CLIP API v2, HTTPS on the local network | Event stream (SSE) | Lights, plugs, sensors, scenes, automations |
 | IKEA DIRIGERA | Local API on port 8443 | WebSocket | Lights, outlets, blinds, air purifiers, sensors, scenes |
 | tado | Cloud API (`my.tado.com`) | Polling every 15 minutes | Heating zones. See "tado rate limit" |
-| Matter devices | Not supported now | | See "Later options" |
+| Matter devices | Not supported | | See "Known limits" |
 
-All devices stay in Apple Home. Nothing is unpaired and the hubs do not change.
+The devices can stay in Apple Home. Pairing adds one access key on each Hue and DIRIGERA hub. It
+changes nothing else on the hubs.
 
 ```
 Stream Deck <--USB--> deck.py --+--HTTPS + SSE-->        Hue Bridge
@@ -51,10 +52,28 @@ cd stream-deck-home
 make install
 ```
 
-`make install` copies `deck.py` to `~/.local/share/stream-deck-home/`, writes the command
-`~/.local/bin/stream-deck-home` and starts a launchd service. The service starts at login and restarts
-after a crash. The log is `~/Library/Logs/stream-deck-home.log`. Run `make install` again after you
-change `deck.py`. Without installation, use `uv run deck.py <command>` in the project folder.
+`make install` does these steps:
+
+1. It copies `deck.py` and `deck.py.lock` to `~/.local/share/stream-deck-home/`.
+2. It writes the command `~/.local/bin/stream-deck-home`. The command runs `uv run --script` on the
+   installed `deck.py`.
+3. It writes the launch agent `~/Library/LaunchAgents/dev.elmar.stream-deck-home.plist` and starts it.
+
+The launch agent `dev.elmar.stream-deck-home` runs `stream-deck-home serve`. It starts at login and
+restarts after a crash. It writes to the log `~/Library/Logs/stream-deck-home.log`. To use another
+prefix than `~/.local`, run `make install PREFIX=<folder>`. Run `make install` again after you change
+`deck.py`. Without installation, use `uv run deck.py <command>` in the project folder.
+
+**Lock file.** `deck.py.lock` pins the exact versions of the dependencies (`pillow`, `streamdeck`,
+`websocket-client`). `uv run` uses the lock file that stands next to the script. To update the pinned
+versions, run:
+
+```sh
+uv lock --script deck.py --upgrade
+```
+
+To check the lock file without a change, run `uv lock --script deck.py --check`. After you change the
+dependency list at the top of `deck.py`, run `uv lock --script deck.py`. Then run `make install` again.
 
 Before the service shows anything, pair at least one hub (next section). Without a paired hub, key 0
 shows "No hub paired".
@@ -63,6 +82,10 @@ shows "No hub paired".
 
 Pairing needs you at the hub. Run these commands in a terminal. Each one finds the hub on the network
 by itself. When that fails, add `--host <ip address of the hub>`.
+
+**Use `--host`.** The pairing does not verify the identity of the hub. A device on your network can
+answer the discovery and receive the pairing. Run `stream-deck-home pair hue --host <ip>` or
+`stream-deck-home pair ikea --host <ip>` with the address that you know (see "Security").
 
 **Local Network (macOS).** On the first run, macOS asks whether the program may find devices on the
 local network. Until you allow it, connections fail with "No route to host". Allow it in the dialog, or
@@ -75,10 +98,13 @@ open. `PAIR_DEBUG=1 stream-deck-home pair ikea` prints what the hub answers (nev
 stream-deck-home pair hue
 ```
 
-1. The command finds the bridge (mDNS `_hue._tcp`, then `discovery.meethue.com`).
+1. Without `--host`, the command finds the bridge (mDNS `_hue._tcp`, then `discovery.meethue.com`).
 2. It prints "Press the round link button on the Hue Bridge now". Press the button on top of the bridge.
-3. The command asks the bridge every 2 s for up to 3 minutes. It saves the application key, the bridge id
-   and the fingerprint of the bridge certificate.
+3. The command asks the bridge every 2 s for up to 3 minutes. It saves the address, the application key,
+   the bridge id and the SHA-256 fingerprint of the bridge certificate. The first certificate that the
+   bridge shows is the one that is pinned (trust on first use).
+4. When the bridge was found by discovery, the command compares the bridge id with the one that was
+   announced. When they differ, it saves nothing. With `--host` there is no such check.
 
 **IKEA DIRIGERA**
 
@@ -86,10 +112,12 @@ stream-deck-home pair hue
 stream-deck-home pair ikea
 ```
 
-1. The command finds the hub (mDNS `_ihsp._tcp`) and asks for a pairing code (OAuth with PKCE).
+1. Without `--host`, the command finds the hub (mDNS `_ihsp._tcp`). It asks the hub for a pairing code
+   (OAuth with PKCE).
 2. It prints "Press the action button on the DIRIGERA hub now". Press the button on the bottom of the hub.
-3. The command asks the hub every 2 s for up to 3 minutes. It saves the access token and the fingerprint of
-   the hub certificate.
+3. The command asks the hub every 2 s for up to 3 minutes. It saves the address, the access token and the
+   SHA-256 fingerprint of the hub certificate. The first certificate that the hub shows is the one that is
+   pinned (trust on first use). The command cannot compare the hub with an announced identity.
 
 **tado**
 
@@ -97,21 +125,26 @@ stream-deck-home pair ikea
 stream-deck-home pair tado
 ```
 
-1. The command prints a web address and a code, and opens the address in your browser.
+1. The command prints a web address and a code. It opens the address in your browser when the address
+   is on `login.tado.com`.
 2. Log in to tado in the browser and confirm the code.
-3. The command saves the refresh token and the first home of the account.
+3. The command saves the refresh token and the first home of the account. When the account has more than
+   one home, the command prints which home it uses.
 
-`--host` is not used for tado, because tado has no local access.
+`--host` has no effect for tado, because tado has no local access.
 
 **Other commands**
 
-- `stream-deck-home status` lists the paired hubs, whether they answer, and how many rooms, devices
-  and scenes each one has. It does not print tokens.
-- `stream-deck-home names` lists every room, device and scene with its source, id and current name (see
-  "Names"). It does not print tokens and it skips tado.
-- `stream-deck-home unpair hue|ikea|tado` removes the credentials of one hub from this Mac. The access
-  key stays on the hub until you remove it there (Hue: developer page of the bridge or the Hue app;
-  DIRIGERA: IKEA Home smart app; tado: your tado account).
+- `stream-deck-home status` prints one line for each hub. For Hue and DIRIGERA it shows whether the hub
+  answers and how many rooms, devices and scenes it has. For tado it prints only that tado is paired. It
+  does not contact tado, because a token refresh would rotate the refresh token under a running deck.
+  It does not print tokens.
+- `stream-deck-home names` lists every room, device and scene of Hue and DIRIGERA (see "Names"). It does
+  not contact tado. It does not print tokens.
+- `stream-deck-home unpair hue|ikea|tado` deletes the local credentials of one hub from this Mac. It does
+  not revoke the access key. The key stays valid on the hub until you remove it there (Hue: developer
+  page of the bridge or the Hue app; DIRIGERA: IKEA Home smart app; tado: your tado account).
+- `stream-deck-home --help` lists all commands. `serve` is the default command.
 
 ## Layout
 
@@ -140,7 +173,7 @@ stream-deck-home pair tado
 Rooms with the same name (any case) from different hubs are one room. There is one home.
 
 **Room page:** key 0 is Back. Key 1 switches all devices of the room off (or on, when all are off).
-Keys 2-13 are the accessories, sorted by name. Key 14 pages when there are more than 12. For Hue lights,
+Keys 2-14 are the accessories. When there are more than 13, key 14 pages and keys 2-13 hold 12. For Hue lights,
 "all off" of a room is one command to the Hue room. "All lights off" on the home page is one command
 to the whole Hue home. Lights of other hubs get one command each.
 
@@ -202,8 +235,7 @@ Open it in a browser.
 Choose one with the constant `THEME` at the top of `deck.py`, with `--theme graphite|vivid|neon`
 before the command (`stream-deck-home --theme neon serve`), or with the environment variable
 `STREAM_DECK_HOME_THEME`. The option wins over the variable, and the variable wins over the constant.
-`uv run deck.py shots` writes the home page and a room page in every theme to
-`/tmp/homedeck-<theme>-home.png` and `/tmp/homedeck-<theme>-room.png`.
+`uv run deck.py shots` renders sample pages of the demo home (see "Development").
 
 ## Names
 
@@ -228,7 +260,8 @@ rooms merge. Two rooms that you give the same alias become one room.
    and renamed devices").
 2. Use the optional file `~/.config/stream-deck-home/names.json`. It is a plain user file with no
    secrets. The deck reads it again when its modification time changes, so an edit shows within about
-   2 seconds. A restart is not necessary. A broken file is logged and the last good names stay.
+   2 seconds (`NAMES_POLL`). A restart is not necessary. A broken file is logged and the last good names
+  stay. When the file is broken at start-up, the deck uses no aliases and hides nothing.
 
 ```json
 {
@@ -239,31 +272,27 @@ rooms merge. Two rooms that you give the same alias become one room.
 }
 ```
 
-- A key is the exact hub name or the prefixed id (`hue:...`, `ikea:...`, `tado:...`). The id wins
-  over the name. Use the id when two devices have the same name.
+- A key is the hub name or the prefixed id (`hue:...`, `ikea:...`, `tado:...`). Keys match without
+  regard to case and without spaces at the start and the end. The id wins over the name. Use the id
+  when two devices have the same name.
+- An alias that is `null`, empty or only spaces is ignored. The item keeps its hub name.
 - A device alias also renames the sensors of that device ("Hall sensor temperature" becomes "Hallway
   sensor temperature").
-- Run `stream-deck-home names` to see every room, device and scene. Each line shows the kind, the
-  source, the id and the hub name. A line has `-> alias` when names.json renames it, and `(hidden)` when
-  it hides it. Copy the name or the id from this list.
+- A device without a room belongs to the room "Other". Use `"Other"` under `rooms` to rename
+  that room, or in `hide` to hide it.
+- Run `stream-deck-home names` to see every room, device and scene of Hue and DIRIGERA. The first line
+  shows the path of names.json and whether the file exists. Each other line shows the kind, the source,
+  the id and the hub name. A line has `-> alias` when names.json renames it, and `(hidden)` when it
+  hides it. Rooms have the id `-`. Copy the name or the id from this list.
 
 **Hide scenes and devices.** `hide` is a list of glob patterns (`*` and `?`, case does not matter). A
 pattern matches the hub name or the alias of a scene, a device or a room. Hidden scenes and devices do not
-show and do not count. A hidden room hides all its devices.
+show and do not count. A hidden room hides all its devices and all its scenes.
 
 - Without names.json, the deck hides `dirigera_integration_*`. These are automatic DIRIGERA integration
   scenes.
 - When names.json exists, only its `hide` list counts. A file without `hide` hides nothing. Add
   `"dirigera_integration_*"` to your list to keep these scenes hidden.
-
-**Apple Home names (later option).** To get the names from Apple Home, an app must read HomeKit. There are
-two ways:
-
-- A paid Apple Developer account with a small HomeKit helper app. The earlier `bridge/` design is in the
-  git history (commit `3ebcf66`).
-- A third-party app with a local API, such as Itsyhome.
-
-names.json is the place where such names would land. This is not built now.
 
 ## New, removed and renamed devices
 
@@ -272,9 +301,19 @@ The deck updates itself. Do not restart it and do not pair again.
 - **Live events.** Hue (event stream) and DIRIGERA (WebSocket) send an event when a device or scene is
   added, deleted or renamed, or when a device moves to another room. A new, deleted or renamed room, zone
   or scene does the same. The deck then fetches everything again.
+- **Events during a fetch.** The deck keeps the events that arrive while a fetch runs. It applies them
+  again to the new data, so a change is not lost.
 - **Full refresh.** Every 10 minutes (`FULL_REFRESH`) the deck fetches everything from Hue and DIRIGERA
-  again, in case it missed an event. It does the same after each reconnect.
+  again, in case it missed an event. It does the same after each reconnect. It does not fetch
+  everything when the Hue event stream is quiet for 5 minutes (`SSE_TIMEOUT`). It only connects again.
+- **Unknown device id.** A DIRIGERA event for a device id that the deck does not know changes nothing.
+  The device shows after the next full refresh, at most 10 minutes later.
 - **tado.** Changes show after the next poll (every 15 minutes, `TADO_POLL`).
+- **Hub data that cannot be read.** When the data of one hub cannot be translated, the deck keeps the last
+  good data of that hub. It logs the error once. The other hubs stay online and keep working.
+- **IP address change.** After a failure the deck looks for the hub again (Hue: by its bridge id).
+  It saves a new address only when the certificate at that address has the pinned fingerprint. It
+  checks at most 5 addresses (`RELOCATE_TRIES`).
 - **Open pages.** When the room or device that you look at disappears, the deck goes back one level.
 
 Pair again only after a hub reset or when you get a new hub.
@@ -288,8 +327,12 @@ tado limits the requests of accounts without the paid subscription to about 100 
 - It asks once more after each write. Target presses within 3 s (`TADO_COALESCE`) become one request.
 - After HTTP 429 the deck sends nothing to tado for the time of the `Retry-After` header (one hour
   when there is none) and shows the last known values.
-- The refresh token of tado rotates. The deck saves the new one at each refresh. Do not run two copies
-  of the deck with the same credentials.
+- The refresh token of tado rotates. The deck saves the new one at each renewal. The credentials file
+  also holds the short-lived access token and its expiry time. Before the deck renews the token, it
+  reads the file again. When another process saved a newer token, the deck uses that token. Do not run
+  two copies of the deck with the same credentials. Two processes that renew the token at the same
+  moment can still collide (see "Known limits").
+- `status`, `names` and `shots --live` do not contact tado, for the same reason.
 
 A manual target in tado ends at the next time block of the schedule, like the tado app does by default
 (`TADO_TERMINATION`). When tado answers HTTP 422 to that, the deck tries once again with a manual
@@ -301,41 +344,54 @@ The access keys control your house. Treat `~/.config/stream-deck-home/credential
 password:
 
 - The folder has mode 0700 and the file has mode 0600. The deck fixes a wider mode when it reads the
-  file. The file is replaced in one step, so a crash does not leave half a file.
+  file. The file is replaced in one step, so a crash does not leave half a file. The deck never
+  overwrites a file that it cannot read.
 - The deck never prints or logs tokens.
-- Hue and DIRIGERA use self-signed certificates. The deck does not switch the check off. At pairing it
-  saves the SHA-256 fingerprint of the certificate. For each later connection it compares the
-  certificate with that fingerprint **before** it sends the key. When it differs, the deck refuses the
-  connection (see Troubleshooting). A Hue Bridge is found again by its bridge id when its IP address
-  changes.
-- At the first contact in pairing, nobody can verify the hub yet. Pair on a network that you trust.
-  Hue pairing also compares the bridge id with the one that the bridge announced on the network.
+- Hue and DIRIGERA use self-signed certificates. The deck does not switch the check off. It pins the
+  certificate by its SHA-256 fingerprint. For each connection it compares the certificate with the pin
+  **before** it sends the key. When it differs, the deck refuses the connection (see Troubleshooting).
+  A hub without a pin is refused.
+- **Trust on first use.** At pairing, the deck saves the first certificate that the hub shows. Nobody can
+  verify the hub at that moment. Pair on a network that you trust.
+- **Discovery is not verified at pairing.** Anyone on the network can answer the mDNS or cloud
+  discovery. Use `pair hue --host <ip>` and `pair ikea --host <ip>` with an address that you know. Hue
+  pairing without `--host` compares the bridge id with the announced one. That check does not prove
+  the identity of the hub.
+- When the IP address of a hub changes, the deck saves the new address only when the certificate there
+  matches the pin.
 - Everyone who can read the credentials file (your user, and root) can control your home. Do not copy
   it, do not commit it and do not put it in a backup that you share.
 - tado uses the normal certificate check of the system.
-
-## Apple Home scenes and automations
-
-The scenes and automations of Apple Home are not visible in this deck. Apple keeps them in iCloud.
-Only an app with the HomeKit entitlement can read them, and Apple gives that entitlement to paid
-developer accounts only. The deck shows the scenes and automations of the hubs themselves (Hue,
-DIRIGERA). A later option is a paid developer account, or an app such as Itsyhome that already reads
-HomeKit.
-
-## Later options
-
-- **Matter devices** (5 devices in the test home). They are not supported now. The way is multi-admin:
-  in the Apple Home app, open the device, choose "Turn on pairing mode" to get a pairing code, and pair
-  the device a second time with the deck. Nothing is unpaired.
-- Apple Home scenes and automations (see above).
+- `unpair` deletes only the local token. The key stays valid on the hub (see "Other commands").
 
 ## Settings
 
-Constants at the top of `deck.py`: `THEME`, `BRIGHTNESS` (60), `DIM` (10), `IDLE_MINUTES` (5),
-`LONG` (0.5 s), `HOLD` (1 s), `REPEAT_DELAY` and `REPEAT` (auto-repeat), `FLASH` (0.6 s), `RETRY` and
-`RETRY_MAX` (2 s to 60 s), `COALESCE`, `HUE_INTERVAL`, `HUE_GROUP_INTERVAL`, `IKEA_INTERVAL`,
-`TADO_POLL`, `TADO_COALESCE`, `TADO_RATE_WAIT`, `TADO_TERMINATION`, `IKEA_BLINDS_INVERTED`,
-`FULL_REFRESH` (600 s), `NAMES_POLL` (2 s), `DEFAULT_HIDE`.
+Constants at the top of `deck.py`. Change one, then run `make install` again.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `THEME` | `graphite` | Key look (see "Themes"). |
+| `BRIGHTNESS`, `DIM` | 60, 10 | Deck brightness, and brightness while idle. |
+| `IDLE_MINUTES` | 5 | Minutes without a key press before the deck dims. |
+| `LONG`, `HOLD` | 0.5 s, 1 s | Long press, and hold for locks, garage doors and the security system. |
+| `REPEAT_DELAY`, `REPEAT` | 0.5 s, 0.2 s | Auto-repeat of the +/- keys. |
+| `FLASH` | 0.6 s | Flash of a key after a scene or a failed write. |
+| `RETRY`, `RETRY_MAX` | 2 s, 60 s | Wait before a hub is tried again. It doubles up to the maximum. |
+| `HTTP_TIMEOUT` | 10 s | Time for one request to a hub. |
+| `SSE_TIMEOUT` | 300 s | Quiet time on the Hue event stream before the deck connects again. |
+| `WS_PING` | 30 s | Quiet time on the DIRIGERA WebSocket before a ping. |
+| `COALESCE` | 0.05 s | Writes to one device within this time become one request. |
+| `HUE_INTERVAL`, `HUE_GROUP_INTERVAL`, `IKEA_INTERVAL` | 0.1 s, 1 s, 0.1 s | Time between commands to a hub. |
+| `FULL_REFRESH` | 600 s | Time between two full fetches from Hue and DIRIGERA. |
+| `RELOCATE_TRIES` | 5 | Most addresses that the deck checks after an IP change. |
+| `NAMES_POLL` | 2 s | Time between two checks of names.json. |
+| `DEFAULT_HIDE` | `dirigera_integration_*` | Hidden items when names.json does not exist. |
+| `TADO_POLL` | 900 s | Time between tado polls (see "tado rate limit"). |
+| `TADO_COALESCE` | 3 s | tado target presses within this time become one request. |
+| `TADO_RATE_WAIT` | 3600 s | Wait after HTTP 429 when tado sends no `Retry-After`. |
+| `TADO_TERMINATION` | `TADO_MODE` | End of a manual overlay (see "tado rate limit"). |
+| `TADO_DEFAULT_TARGET` | 21 | Target in degrees when you choose "Heat" and tado has no target. |
+| `IKEA_BLINDS_INVERTED` | `True` | Direction of DIRIGERA blinds (see Troubleshooting). |
 
 Hue gets about 10 light commands per second and 1 room command per second. Rapid repeats (the +/-
 keys while held) are collected and only the latest value is sent.
@@ -356,11 +412,16 @@ keys while held) are collected and only the latest value is sent.
 - **Key 0 shows "Offline:" and a list.** No hub answers. The deck tries again after 2 s, 4 s and so on
   up to 60 s. Run `stream-deck-home status`. Read the log `~/Library/Logs/stream-deck-home.log`.
 - **tado shows old values.** The deck polls every 15 minutes, and it waits after HTTP 429.
+- **tado: "tado refused the login ... pair tado again".** The refresh token is not valid any more. Run
+  `stream-deck-home unpair tado` and `stream-deck-home pair tado`.
+- **A hub shows old values and stays online.** The deck cannot read the new data of that hub. It keeps
+  the last good data and logs the error. Read the log.
 - **Blinds open when you close them (DIRIGERA).** The direction of `blindsTargetLevel` is a guess
   (0 = open). Change `IKEA_BLINDS_INVERTED` to `False` in `deck.py`.
 - **A DIRIGERA water sensor or air purifier does not work.** The attribute names (`waterLeakDetected`,
   `fanMode`) are not verified against a real device. Unknown attributes are ignored. Report what
   `GET /v1/devices` shows.
+- **A new DIRIGERA device does not show.** Wait for the next full refresh (at most 10 minutes).
 
 ## Development
 
@@ -370,10 +431,15 @@ keys while held) are collected and only the latest value is sent.
   math, the translation of sample Hue, DIRIGERA and tado data into the model, the translation of writes
   back to requests, room merging, name aliases and hiding, structure events, the credentials file mode,
   the coalescing of writes, the fit of labels and the rendering of every page in every theme.
-- `uv run deck.py shots [folder]` writes PNG renders to `/tmp/homedeck-*.png`.
-- `uv run deck.py shots --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose rotating
-  token would break a running deck), waits up to 20 s for the first snapshot and writes the home, every
-  room, the scenes and the status page to `/tmp/homedeck-live-<page>.png`.
+- `uv run deck.py shots [folder]` renders pages of the demo home to `homedeck-<page>.png` (home, room,
+  light, lights2, thermostat, status, hall). It also writes the home page and a room page in every theme
+  to `homedeck-<theme>-home.png` and `homedeck-<theme>-room.png`. With a folder, the files go there.
+  Without a folder, the command makes a new private folder (mode 0700) in the temp directory and
+  prints its path. It prints the path of each file.
+- `uv run deck.py shots [folder] --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose
+  rotating token would break a running deck). It waits up to 20 s for the hubs. It writes the home,
+  every room, the scenes and the status page of your real home to `homedeck-live-<page>.png`. The
+  folder rules are the same. The images show your room and device names. Keep them private.
 
 API names that the code follows from the public descriptions and that no real hub has confirmed are
 marked in the code (DIRIGERA leak sensor, purifier fan mode, blinds direction).
@@ -387,22 +453,36 @@ stream-deck-home unpair tado
 make uninstall
 ```
 
-`make uninstall` removes the service, the command and `~/.local/share/stream-deck-home`. With Homebrew:
-`brew services stop stream-deck-home` and `brew uninstall stream-deck-home`. Remove the folder
-`~/.config/stream-deck-home` when you do not need the credentials any more. Remove the access keys on the
-hubs too (see "Other commands").
+`make uninstall` stops the launch agent `dev.elmar.stream-deck-home` and removes its plist, the command
+`~/.local/bin/stream-deck-home` and the folder `~/.local/share/stream-deck-home`. It does not remove
+the credentials or the log. With Homebrew (not published yet): `brew services stop stream-deck-home`
+and `brew uninstall stream-deck-home`. Remove the folder `~/.config/stream-deck-home` when you do not
+need the credentials any more. Remove the log `~/Library/Logs/stream-deck-home.log` too. `unpair`
+deletes only the local token, so remove the access keys on the hubs too (see "Other commands").
 
 ## Files
 
 - `deck.py`: the whole program, with the source adapters and the commands `serve`, `demo`, `test`,
   `shots`, `pair`, `status`, `names` and `unpair`.
+- `deck.py.lock`: the pinned versions of the dependencies.
 - `docs/themes.html`: mockup of the three themes.
-- `Makefile`, `dev.elmar.stream-deck-home.plist`: local install as a launchd service.
+- `Makefile`, `dev.elmar.stream-deck-home.plist`: local install as a launch agent.
+- `~/.config/stream-deck-home/credentials.json`: tokens and hub certificate pins (mode 0600).
+- `~/.config/stream-deck-home/names.json`: your optional aliases and hide list.
+- `~/Library/Logs/stream-deck-home.log`: the log of the launch agent.
 
 ## Known limits
 
 - Only the first Stream Deck is used.
-- One home only. Zones of Hue that are not rooms are not shown.
+- One home only. Zones of Hue that are not rooms are not shown as rooms.
+- tado: only the first home of the account is used.
+- `unpair` deletes the local token only. The key stays valid on the hub.
+- A room with Hue and IKEA lights: the Hue lights switch one by one, not with one room command.
+- A DIRIGERA event for an unknown device id waits for the next full refresh (at most 10 minutes).
+- Matter devices are not supported.
+- Two processes that renew the tado token at the same moment can still collide.
+- Pairing does not verify the identity of the hub. Use `--host` (see "Security").
 - Optimistic updates assume that a write works. A device that accepts a write and later reverts it
   shows the right state only when it reports the change.
-- The old Apple HomeKit bridge was removed. The git history keeps it.
+- Not verified on real devices: the tado thermostat mode list, the DIRIGERA field names, the blinds
+  direction, leak sensors and air purifiers.

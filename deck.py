@@ -21,13 +21,14 @@ security system need a 1 s hold. Writes show at once and revert (key flashes red
   uv run deck.py serve   # owns the Stream Deck (Elgato app must be closed)
   uv run deck.py demo    # same deck against a fake home, no hub needed
   uv run deck.py test    # self-check, no hardware and no network needed
-  uv run deck.py shots   # write PNG renders of some pages to /tmp/homedeck-*.png
-  uv run deck.py shots --live   # the same for the real home (paired hubs, not tado): /tmp/homedeck-live-*.png
+  uv run deck.py shots [folder]   # write PNG renders of some pages (default: a new private folder, printed)
+  uv run deck.py shots --live     # the same for the real home (paired hubs, not tado)
 """
 import argparse
 import base64
 import colorsys
 import copy
+import fcntl
 import fnmatch
 import functools
 import hashlib
@@ -73,6 +74,7 @@ HUE_GROUP_INTERVAL = 1.0  # seconds between Hue grouped_light commands (Hue allo
 IKEA_INTERVAL = 0.1  # seconds between DIRIGERA commands
 TADO_POLL = 15 * 60  # seconds between tado polls. Free accounts get about 100 requests per day: calibration knob
 TADO_COALESCE = 3.0  # seconds: tado target presses within this time become one request
+RELOCATE_TRIES = 5  # most addresses that relocate checks per run
 TADO_RATE_WAIT = 3600.0  # seconds to wait after HTTP 429 when tado sends no Retry-After
 TADO_TERMINATION = {"type": "TADO_MODE"}  # overlay ends at the next time block, like the tado app's default
 TADO_TERMINATION_FALLBACK = {"type": "MANUAL"}  # used once when tado answers HTTP 422 to the line above
@@ -1186,10 +1188,21 @@ class Creds:
             os.makedirs(folder, mode=0o700, exist_ok=True)
             os.chmod(folder, 0o700)
             fd, tmp = tempfile.mkstemp(dir=folder)  # created with mode 0600
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    if hasattr(fcntl, "F_FULLFSYNC"):  # macOS: fsync does not reach the disk
+                        fcntl.fcntl(f.fileno(), fcntl.F_FULLFSYNC)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
 
 class PinError(OSError):
@@ -1305,28 +1318,36 @@ def mdns(stype, wait=3.0):
 
 
 def find_hue(bridge_id=None):
-    """{"host", "bridge_id"} of a Hue Bridge (the one with `bridge_id` when given), or None."""
+    """[{"host", "bridge_id"}] of the Hue Bridges found (only the one with `bridge_id` when given)."""
     want = bridge_id.upper() if bridge_id else None
-    for h in mdns("_hue._tcp"):
-        bid = h["txt"].get("bridgeid", "").upper()
-        if want is None or bid == want:
-            return {"host": h["ip"], "bridge_id": bid}
+    found = [{"host": h["ip"], "bridge_id": h["txt"].get("bridgeid", "").upper()} for h in mdns("_hue._tcp")]
+    found = [h for h in found if want is None or h["bridge_id"] == want]
+    if found:
+        return found
     try:  # fallback: the Hue cloud lists the bridges behind your public address
         _, obj, _ = cloud_call("discovery.meethue.com", "GET", "/")
-        for b in obj or []:
-            if want is None or b["id"].upper() == want:
-                return {"host": b["internalipaddress"], "bridge_id": b["id"].upper()}
+        return [{"host": b["internalipaddress"], "bridge_id": b["id"].upper()}
+                for b in obj or [] if want is None or b["id"].upper() == want]
     except (OSError, KeyError, TypeError):
-        pass
-    return None
+        return []
 
 
 def find_ikea():
-    """IP of a DIRIGERA hub, or None."""
-    for h in mdns("_ihsp._tcp"):
-        if h["txt"].get("type", "DIRIGERA") == "DIRIGERA":
-            return h["ip"]
-    return next((h["ip"] for h in mdns("_hap._tcp") if "DIRIGERA" in h["name"].upper()), None)
+    """IPs of the DIRIGERA hubs found."""
+    ips = [h["ip"] for h in mdns("_ihsp._tcp") if h["txt"].get("type", "DIRIGERA") == "DIRIGERA"]
+    return ips or [h["ip"] for h in mdns("_hap._tcp") if "DIRIGERA" in h["name"].upper()]
+
+
+def pinned_host(hosts, port, pin, limit=RELOCATE_TRIES):
+    """First of at most `limit` hosts whose certificate has the fingerprint `pin`, or None.
+    A new address is only saved after this check."""
+    for host in hosts[:limit]:
+        try:
+            pinned_socket(host, port, pin).close()
+            return host
+        except OSError:  # PinError is an OSError too
+            continue
+    return None
 
 
 def dig(d, *keys, default=None):
@@ -1609,6 +1630,7 @@ class Source:
     def __init__(self, cfg, store):
         self.cfg, self.store = cfg, store
         self.online, self.lock = False, threading.RLock()
+        self.last_good, self.last_error = None, None  # last translate() result; last logged error text
         self.notify = lambda: None
         self.backlog, self.fetching = None, threading.Lock()  # backlog: events that arrive during a fetch
         self.co = Coalescer(self._flush_batch, self.delay)
@@ -1745,9 +1767,9 @@ class Hue(Source):
             self.replay()
 
     def relocate(self):
-        hit = find_hue(self.cfg.get("bridge_id"))
-        if hit and hit["host"] != self.cfg["host"]:
-            self.cfg["host"] = hit["host"]
+        host = pinned_host([h["host"] for h in find_hue(self.cfg.get("bridge_id"))], 443, self.cfg["pin"])
+        if host and host != self.cfg["host"]:
+            self.cfg["host"] = host
             self.save()
 
     def stream(self):
@@ -2010,7 +2032,7 @@ class Ikea(Source):
             self.replay()
 
     def relocate(self):
-        ip = find_ikea()
+        ip = pinned_host(find_ikea(), self.PORT, self.cfg["pin"])
         if ip and ip != self.cfg["host"]:
             self.cfg["host"] = ip
             self.save()
@@ -2021,7 +2043,7 @@ class Ikea(Source):
         ws = websocket.WebSocket()
         try:
             ws.connect(f"wss://{self.cfg['host']}:{self.PORT}/v1", socket=sock,
-                       header=["Authorization: Bearer " + self.cfg["token"]])
+                       header=["Authorization: Bearer " + self.cfg["token"]], redirect_limit=0)
             ws.settimeout(WS_PING)
             while True:
                 try:
@@ -2169,6 +2191,16 @@ def tado_mode(state):
     return (1 if state.get("overlay") else 3), target
 
 
+def retry_after(value):
+    """Seconds to wait after HTTP 429: the header value, or TADO_RATE_WAIT when it is missing, not a
+    finite number or negative. At most one day."""
+    try:
+        wait = float(value or "")
+    except ValueError:
+        return TADO_RATE_WAIT
+    return min(wait, 86400.0) if math.isfinite(wait) and wait >= 0 else TADO_RATE_WAIT
+
+
 class Tado(Source):
     """tado, cloud API. Free accounts get about 100 requests per day, so it polls every TADO_POLL seconds,
     refreshes once after a write and stops for the Retry-After time after HTTP 429."""
@@ -2185,13 +2217,20 @@ class Tado(Source):
         with self.lock:
             if self.access and time.time() < self.expires - 30:
                 return self.access
+            stored = self.store.get(self.name)  # another process may have rotated the refresh token
+            if isinstance(stored, dict) and stored.get("refresh_token") and stored["refresh_token"] != self.cfg["refresh_token"]:
+                self.cfg["refresh_token"] = stored["refresh_token"]
+                if stored.get("access_token") and time.time() < stored.get("expires_at", 0) - 30:
+                    self.access, self.expires = stored["access_token"], stored["expires_at"]
+                    return self.access
             st, obj, _ = cloud_call("login.tado.com", "POST", "/oauth2/token", form={
                 "client_id": TADO_CLIENT, "grant_type": "refresh_token", "refresh_token": self.cfg["refresh_token"]})
             if st != 200 or not isinstance(obj, dict) or "access_token" not in obj:
                 raise OSError(f"tado refused the login (HTTP {st}): pair tado again if this stays")
-            self.cfg["refresh_token"] = obj.get("refresh_token", self.cfg["refresh_token"])
-            self.save()
             self.access, self.expires = obj["access_token"], time.time() + obj.get("expires_in", 600)
+            self.cfg["refresh_token"] = obj.get("refresh_token", self.cfg["refresh_token"])
+            self.cfg["access_token"], self.cfg["expires_at"] = self.access, self.expires  # for a second process
+            self.save()
             return self.access
 
     def api(self, method, path, body=None):
@@ -2200,10 +2239,7 @@ class Tado(Source):
         st, obj, headers = cloud_call(self.HOST, method, "/api/v2" + path, body=body,
                                       headers={"Authorization": "Bearer " + self.token()})
         if st == 429:
-            try:
-                wait = float(headers.get("Retry-After") or "")
-            except ValueError:
-                wait = TADO_RATE_WAIT
+            wait = retry_after(headers.get("Retry-After"))
             self.blocked = time.time() + wait
             raise RateLimited(f"tado answered HTTP 429: no requests for {wait / 60:.0f} minutes")
         return st, obj
@@ -2322,8 +2358,21 @@ class Hub:
             if self.names.check():
                 self.update()
 
+    @staticmethod
+    def part(s):
+        """translate() of one source. When it raises, the last good result stays (empty before the first one),
+        so one broken source does not stop the others. The error is logged once per distinct text."""
+        try:
+            s.last_good, s.last_error = s.translate(), None
+        except Exception as error:
+            text = describe(error)
+            if text != s.last_error:
+                s.last_error = text
+                log(f"{s.name}: {text}")
+        return s.last_good or {"rooms": [], "accessories": [], "scenes": [], "triggers": []}
+
     def snapshot(self):
-        return {"type": "snapshot", "homes": [merge([(s.name, s.online, s.translate()) for s in self.sources], self.names)]}
+        return {"type": "snapshot", "homes": [merge([(s.name, s.online, self.part(s)) for s in self.sources], self.names)]}
 
     def update(self):
         """A source changed: send what differs from the last state."""
@@ -2866,6 +2915,82 @@ def test_hubs():
         assert seen == [{"k": {BRI: 40}, "k2": {ON: True}}] and results == [True] * 5, (seen, results)
 
 
+def test_hardening():
+    global cloud_call, pinned_socket, find_hue
+    saved = cloud_call, pinned_socket, find_hue
+    try:
+        # tado: a refresh token that another process saved is used, and its valid access token too (no network)
+        class FakeStore:
+            def __init__(self, entry):
+                self.entry, self.puts = entry, []
+
+            def get(self, name):
+                return self.entry
+
+            def put(self, name, value):
+                self.puts.append(copy.deepcopy(value))
+
+        def no_network(*a, **k):
+            raise AssertionError("network call")
+
+        cloud_call = no_network
+        fresh = {"refresh_token": "new", "home_id": 1, "access_token": "A2", "expires_at": time.time() + 600}
+        tado = Tado({"home_id": 1, "refresh_token": "old"}, FakeStore(fresh))
+        assert tado.token() == "A2" and tado.cfg["refresh_token"] == "new"
+        sent = []
+        cloud_call = lambda host, method, path, **k: (sent.append(k["form"]["refresh_token"]) or
+                                                      (200, {"access_token": "A3", "refresh_token": "newer", "expires_in": 600}, {}))
+        store = FakeStore({"refresh_token": "new", "home_id": 1})  # newer token, no valid access token: renew with it
+        tado = Tado({"home_id": 1, "refresh_token": "old"}, store)
+        assert tado.token() == "A3" and sent == ["new"] and store.puts[-1]["refresh_token"] == "newer"
+        # Retry-After: only a finite number from 0 to one day is used
+        assert [retry_after(v) for v in ("inf", "nan", "-5", "1e9", "abc", None, "30", "0")] == [
+            TADO_RATE_WAIT, TADO_RATE_WAIT, TADO_RATE_WAIT, 86400.0, TADO_RATE_WAIT, TADO_RATE_WAIT, 30.0, 0.0]
+        # snapshot: a source whose translate raises keeps its last good part
+        tado = Tado({"home_id": 123, "refresh_token": "r"}, FakeStore(None))
+        hub = Hub(queue.Queue(), [tado])
+        tado.zones, tado.states = TADO_ZONES, tado_states()
+        assert len(hub.snapshot()["homes"][0]["accessories"]) == 1
+        tado.translate = lambda: 1 / 0
+        assert len(hub.snapshot()["homes"][0]["accessories"]) == 1 and tado.last_error.startswith("ZeroDivisionError")
+        tado.last_good = None
+        assert hub.snapshot()["homes"][0]["accessories"] == []
+        # Creds.put: no temp file is left after a failing dump, and the old file stays
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Creds(os.path.join(tmp, "c.json"))
+            store.put("a", {"k": 1})
+            try:
+                store.put("b", {"k": object()})
+                raise AssertionError("expected TypeError")
+            except TypeError:
+                pass
+            assert os.listdir(tmp) == ["c.json"] and store.get("a") == {"k": 1} and store.get("b") is None
+        # relocate: a candidate whose pin fails is not saved, the next candidate that matches is
+        class Sock:
+            def close(self):
+                pass
+
+        def fake_pin(host, port, pin, *a, **k):
+            if host != "10.0.0.3":
+                raise PinError("wrong certificate")
+            return Sock()
+
+        pinned_socket = fake_pin
+        find_hue = lambda bridge_id=None: [{"host": "10.0.0.2", "bridge_id": "B"}]
+        saves = []
+        hue = Hue({"host": "10.0.0.1", "bridge_id": "B", "pin": "p", "key": "k"}, FakeStore(None))
+        hue.save = lambda: saves.append(hue.cfg["host"])
+        hue.relocate()
+        assert saves == [] and hue.cfg["host"] == "10.0.0.1"
+        find_hue = lambda bridge_id=None: [{"host": "10.0.0.2", "bridge_id": "B"}, {"host": "10.0.0.3", "bridge_id": "B"}]
+        hue.relocate()
+        assert saves == ["10.0.0.3"]
+        assert pinned_host([f"10.1.0.{i}" for i in range(9)] + ["10.0.0.3"], 443, "p") is None  # only 5 are tried
+    finally:
+        cloud_call, pinned_socket, find_hue = saved
+    print("ok")
+
+
 def test_names():
     lamp = lambda id, name, room, reach=True: hacc(id, name, room, [hsvc(id + ":l", name, "43", [hchar(ON, False)])], reach)
     sensor = hacc("hue:s", "Hall sensor", "Woonkamer", [hsvc("hue:s:t", "Hall sensor temperature", "8A", [hchar(CURT, 20.0, "float", w=False)])])
@@ -2982,6 +3107,7 @@ def test_names():
 
 def test():
     test_hubs()
+    test_hardening()
     test_names()
     # UUIDs
     assert short("0000004A-0000-1000-8000-0026BB765291") == "4A" and short("0000000E-0000-1000-8000-0026BB765291") == "E"
@@ -3264,7 +3390,15 @@ def test():
     print("ok")
 
 
-def shots(out="/tmp"):
+def private_dir():
+    """New folder for renders, mode 0700 (the home layout is private). Its path is printed."""
+    out = tempfile.mkdtemp(prefix="homedeck-")
+    print(f"Writing to {out}")
+    return out
+
+
+def shots(out=None):
+    out = out or private_dir()
     ui = test_ui()
     for name, page in (("home", ("home", 0)), ("room", ("room", "living", 0)), ("light", ("detail", "floor", 0)),
                        ("lights2", ("detail", "floor", 1)), ("thermostat", ("detail", "thermo", 0)),
@@ -3279,9 +3413,10 @@ def shots(out="/tmp"):
                 print(f"{out}/homedeck-{theme}-{name}.png")
 
 
-def shots_live(out="/tmp"):
+def shots_live(out=None):
     """Render the real home (home, every room, scenes, status) to PNGs without opening the deck.
     tado is left out: its refresh token rotates, so a second client would break a running `serve`."""
+    out = out or private_dir()
     events = queue.Queue()
     hub = paired_hub(events, skip=("tado",))
     if not hub.sources:
@@ -3340,7 +3475,7 @@ def pair_hue(host=None):
     found = None
     if host is None:
         print("Looking for a Hue Bridge on the network...")
-        found = find_hue()
+        found = next(iter(find_hue()), None)
         if not found:
             sys.exit("No Hue Bridge found. Run the command again with --host <ip>.")
         host = found["host"]
@@ -3376,7 +3511,7 @@ def pair_hue(host=None):
 def pair_ikea(host=None):
     if host is None:
         print("Looking for a DIRIGERA hub on the network...")
-        host = find_ikea()
+        host = next(iter(find_ikea()), None)
         if not host:
             sys.exit("No DIRIGERA hub found. Run the command again with --host <ip>.")
         print(f"Found the DIRIGERA hub at {host}.")
@@ -3452,6 +3587,9 @@ def status():
         if not cfg:
             print(f"{name:5} not paired")
             continue
+        if name == "tado":  # no network call: a refresh would rotate the token under a running `serve`
+            print(f"{name:5} paired (not checked: the refresh token rotates)")
+            continue
         try:
             src = cls(cfg, store)
             src.refresh()
@@ -3506,8 +3644,8 @@ def main(argv=None):
                        ("test", "self-check without hardware"), ("status", "paired hubs and counts"),
                        ("names", "list rooms, devices and scenes with source, id and current name (not tado)")):
         sub.add_parser(name, help=text)
-    sh = sub.add_parser("shots", help="write PNG renders to a folder (default /tmp)")
-    sh.add_argument("folder", nargs="?", default="/tmp")
+    sh = sub.add_parser("shots", help="write PNG renders to a folder (default: a new private folder in the temp directory)")
+    sh.add_argument("folder", nargs="?")
     sh.add_argument("--live", action="store_true", help="render the real home from the paired hubs (not tado)")
     pr = sub.add_parser("pair", help="pair a hub")
     pr.add_argument("source", choices=SOURCES)

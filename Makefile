@@ -11,7 +11,7 @@ LOG := $(HOME)/Library/Logs/stream-deck-home.log
 install:
 	@test -n "$(UV)" || { echo "uv not found: brew install uv"; exit 1; }
 	install -d $(PREFIX)/bin $(SHARE)
-	install -m 644 deck.py $(SHARE)
+	install -m 644 deck.py deck.py.lock $(SHARE)
 	printf '#!/bin/sh\nexec "$(UV)" run --script "$(SHARE)/deck.py" "$$@"\n' > $(BIN)
 	chmod 755 $(BIN)
 	sed -e 's#__BIN__#$(BIN)#' -e 's#__LOG__#$(LOG)#' dev.elmar.stream-deck-home.plist > $(PLIST)
