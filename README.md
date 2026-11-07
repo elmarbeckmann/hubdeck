@@ -107,6 +107,8 @@ stream-deck-home pair tado
 
 - `stream-deck-home status` lists the paired hubs, whether they answer, and how many rooms, devices
   and scenes each one has. It does not print tokens.
+- `stream-deck-home names` lists every room, device and scene with its source, id and current name (see
+  "Names"). It does not print tokens and it skips tado.
 - `stream-deck-home unpair hue|ikea|tado` removes the credentials of one hub from this Mac. The access
   key stays on the hub until you remove it there (Hue: developer page of the bridge or the Hue app;
   DIRIGERA: IKEA Home smart app; tado: your tado account).
@@ -166,8 +168,9 @@ to the whole Hue home. Lights of other hubs get one command each.
 | Outlet, switch | On/off. |
 
 **Scenes page:** Back and one key per scene (Hue scenes and smart scenes, DIRIGERA scenes). A press runs
-the scene. The key flashes white when it worked and red when it failed. When two Hue scenes have the same
-name, the room name is added.
+the scene. The key flashes white when it worked and red when it failed. When two keys show the same name,
+the room name is a second small line. Scenes that match the `hide` list (see "Names") do not show. By
+default, these are the automatic DIRIGERA integration scenes.
 
 **Automations page:** Back and one key per Hue automation (behavior instance). Green is enabled, grey
 is disabled. A press toggles it. DIRIGERA and tado have none here.
@@ -176,7 +179,11 @@ is disabled. A press toggles it. DIRIGERA and tado have none here.
 contact open in red, motion highlighted, leak in red), then the unreachable accessories, then the
 accessories with a low battery. A press on an unreachable or low-battery accessory opens its room. The
 alert count on the home page is the number of accessories that are unreachable or low on battery plus
-the sensors that report a leak, smoke or CO. An open contact is not counted.
+the sensors that report a leak, smoke or CO. An open contact is not counted. When two accessories show the
+same name, the room name is a second small line.
+
+**Long names:** a word that is too wide for the key makes the label font smaller (down to 9 px). The
+deck never breaks a word. A word that does not fit at 9 px ends with "…".
 
 **Dimming:** after 5 minutes without a key press the deck goes to the brightness `DIM`. The first
 press only wakes the deck. A new alert also wakes it.
@@ -197,6 +204,80 @@ before the command (`stream-deck-home --theme neon serve`), or with the environm
 `STREAM_DECK_HOME_THEME`. The option wins over the variable, and the variable wins over the constant.
 `uv run deck.py shots` writes the home page and a room page in every theme to
 `/tmp/homedeck-<theme>-home.png` and `/tmp/homedeck-<theme>-room.png`.
+
+## Names
+
+**Where the names come from.** The deck shows the names that the hubs report:
+
+| Hub | Names come from |
+| --- | --- |
+| Hue Bridge | The Philips Hue app |
+| DIRIGERA | The IKEA Home smart app |
+| tado | The tado app (the zone name is the room and the device name is "<zone> heating") |
+
+The names do not come from Apple Home. Apple keeps its own names in iCloud. A rename in Apple Home does
+not reach the hubs, so it does not show on the deck.
+
+**How rooms merge.** Rooms with the same name (any case) from different hubs are one room. "Woonkamer" in
+Hue and "woonkamer" in DIRIGERA are one key on the deck. A room alias (see below) applies before the
+rooms merge. Two rooms that you give the same alias become one room.
+
+**Change a name.** There are two ways:
+
+1. Rename the item in the brand app. The new name shows on the deck within seconds (see "New, removed
+   and renamed devices").
+2. Use the optional file `~/.config/stream-deck-home/names.json`. It is a plain user file with no
+   secrets. The deck reads it again when its modification time changes, so an edit shows within about
+   2 seconds. A restart is not necessary. A broken file is logged and the last good names stay.
+
+```json
+{
+  "devices": {"Hanglamp": "Kitchen pendant", "ikea:3c5f0a1e-0000-0000-0000-000000000000": "Desk (garage)"},
+  "rooms": {"Woonkamer": "Living room"},
+  "scenes": {"Ontladen": "Unload"},
+  "hide": ["dirigera_integration_*", "Spot vloer *"]
+}
+```
+
+- A key is the exact hub name or the prefixed id (`hue:...`, `ikea:...`, `tado:...`). The id wins
+  over the name. Use the id when two devices have the same name.
+- A device alias also renames the sensors of that device ("Hall sensor temperature" becomes "Hallway
+  sensor temperature").
+- Run `stream-deck-home names` to see every room, device and scene. Each line shows the kind, the
+  source, the id and the hub name. A line has `-> alias` when names.json renames it, and `(hidden)` when
+  it hides it. Copy the name or the id from this list.
+
+**Hide scenes and devices.** `hide` is a list of glob patterns (`*` and `?`, case does not matter). A
+pattern matches the hub name or the alias of a scene, a device or a room. Hidden scenes and devices do not
+show and do not count. A hidden room hides all its devices.
+
+- Without names.json, the deck hides `dirigera_integration_*`. These are automatic DIRIGERA integration
+  scenes.
+- When names.json exists, only its `hide` list counts. A file without `hide` hides nothing. Add
+  `"dirigera_integration_*"` to your list to keep these scenes hidden.
+
+**Apple Home names (later option).** To get the names from Apple Home, an app must read HomeKit. There are
+two ways:
+
+- A paid Apple Developer account with a small HomeKit helper app. The earlier `bridge/` design is in the
+  git history (commit `3ebcf66`).
+- A third-party app with a local API, such as Itsyhome.
+
+names.json is the place where such names would land. This is not built now.
+
+## New, removed and renamed devices
+
+The deck updates itself. Do not restart it and do not pair again.
+
+- **Live events.** Hue (event stream) and DIRIGERA (WebSocket) send an event when a device or scene is
+  added, deleted or renamed, or when a device moves to another room. A new, deleted or renamed room, zone
+  or scene does the same. The deck then fetches everything again.
+- **Full refresh.** Every 10 minutes (`FULL_REFRESH`) the deck fetches everything from Hue and DIRIGERA
+  again, in case it missed an event. It does the same after each reconnect.
+- **tado.** Changes show after the next poll (every 15 minutes, `TADO_POLL`).
+- **Open pages.** When the room or device that you look at disappears, the deck goes back one level.
+
+Pair again only after a hub reset or when you get a new hub.
 
 ## tado rate limit
 
@@ -253,7 +334,8 @@ HomeKit.
 Constants at the top of `deck.py`: `THEME`, `BRIGHTNESS` (60), `DIM` (10), `IDLE_MINUTES` (5),
 `LONG` (0.5 s), `HOLD` (1 s), `REPEAT_DELAY` and `REPEAT` (auto-repeat), `FLASH` (0.6 s), `RETRY` and
 `RETRY_MAX` (2 s to 60 s), `COALESCE`, `HUE_INTERVAL`, `HUE_GROUP_INTERVAL`, `IKEA_INTERVAL`,
-`TADO_POLL`, `TADO_COALESCE`, `TADO_RATE_WAIT`, `TADO_TERMINATION`, `IKEA_BLINDS_INVERTED`.
+`TADO_POLL`, `TADO_COALESCE`, `TADO_RATE_WAIT`, `TADO_TERMINATION`, `IKEA_BLINDS_INVERTED`,
+`FULL_REFRESH` (600 s), `NAMES_POLL` (2 s), `DEFAULT_HIDE`.
 
 Hue gets about 10 light commands per second and 1 room command per second. Rapid repeats (the +/-
 keys while held) are collected and only the latest value is sent.
@@ -286,8 +368,8 @@ keys while held) are collected and only the latest value is sent.
   Party scene) without a hub.
 - `uv run deck.py test` is the self-check. It needs no hardware and no network. It checks the color
   math, the translation of sample Hue, DIRIGERA and tado data into the model, the translation of writes
-  back to requests, room merging, event handling, the credentials file mode, the coalescing of writes
-  and the rendering of every page in every theme.
+  back to requests, room merging, name aliases and hiding, structure events, the credentials file mode,
+  the coalescing of writes, the fit of labels and the rendering of every page in every theme.
 - `uv run deck.py shots [folder]` writes PNG renders to `/tmp/homedeck-*.png`.
 - `uv run deck.py shots --live` connects to the paired Hue and DIRIGERA hubs (not tado, whose rotating
   token would break a running deck), waits up to 20 s for the first snapshot and writes the home, every
@@ -313,7 +395,7 @@ hubs too (see "Other commands").
 ## Files
 
 - `deck.py`: the whole program, with the source adapters and the commands `serve`, `demo`, `test`,
-  `shots`, `pair`, `status` and `unpair`.
+  `shots`, `pair`, `status`, `names` and `unpair`.
 - `docs/themes.html`: mockup of the three themes.
 - `Makefile`, `dev.elmar.stream-deck-home.plist`: local install as a launchd service.
 

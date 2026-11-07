@@ -17,6 +17,7 @@ security system need a 1 s hold. Writes show at once and revert (key flashes red
   uv run deck.py pair hue|ikea|tado [--host IP]   # one-time pairing, asks for a button press
   uv run deck.py status                           # paired hubs, reachability, counts
   uv run deck.py unpair hue|ikea|tado             # forget the credentials of a hub
+  uv run deck.py names                            # rooms, devices, scenes with source, id, current name (names.json)
   uv run deck.py serve   # owns the Stream Deck (Elgato app must be closed)
   uv run deck.py demo    # same deck against a fake home, no hub needed
   uv run deck.py test    # self-check, no hardware and no network needed
@@ -27,6 +28,7 @@ import argparse
 import base64
 import colorsys
 import copy
+import fnmatch
 import functools
 import hashlib
 import hmac
@@ -46,10 +48,14 @@ import textwrap
 import threading
 import time
 import urllib.parse
-from collections import Counter, namedtuple
+from collections import namedtuple
 
 CRED_DIR = os.path.expanduser("~/.config/stream-deck-home")
 CRED_FILE = os.path.join(CRED_DIR, "credentials.json")
+NAMES_FILE = os.path.join(CRED_DIR, "names.json")  # optional: name aliases and hidden items. No secrets in it.
+DEFAULT_HIDE = ["dirigera_integration_*"]  # hidden when names.json does not exist: automatic DIRIGERA integration scenes
+NAMES_POLL = 2.0  # seconds between two checks of the mtime of names.json
+FULL_REFRESH = 600  # seconds between two full fetches from Hue and DIRIGERA (safety net for missed events)
 BRIGHTNESS = 60
 DIM = 10  # brightness while idle
 IDLE_MINUTES = 5  # no key press for this long: dim the deck. The first press only wakes it.
@@ -111,8 +117,9 @@ MODES = [("Off", None), ("Heat", 1), ("Cool", 2), ("Auto", 0)]  # name, HeaterCo
 # cat, on and rgb only matter for the look (see paint_*): cat is the kind of key (a navigation key such as
 # "home", "scenes", "alert", "auto", "off", "back", or "room", "light", "dev", "climate", "sensor", or ""
 # for a plain button), on is lit or not, rgb is the light color or the category color of the device.
-Key = namedtuple("Key", "label glyph fill bar badge low sub hint ident tap hold long repeat sel cat on rgb",
-                 defaults=("", None, DARK, None, "", False, "", "", "", None, None, None, False, False, "", False, None))
+Key = namedtuple("Key", "label glyph fill bar badge low sub hint ident tap hold long repeat sel cat on rgb note",
+                 defaults=("", None, DARK, None, "", False, "", "", "", None, None, None, False, False, "", False, None, ""))
+# note: a second small line under the label (the room name, when two keys show the same name)
 THEME = "graphite"  # key look: graphite, vivid or neon. Change with --theme or STREAM_DECK_HOME_THEME (docs/themes.html)
 THEMES = ("graphite", "vivid", "neon")
 DEVICE_RGB = {"outlet": (52, 199, 89), "switch": (52, 199, 89), "fan": (90, 200, 250), "purifier": (90, 200, 250),
@@ -352,6 +359,7 @@ class UI:
             else:
                 out[0] = Key("Loading", "alert", GREY, ident="conn")
             return out
+        self.validate()  # a page can be stale (a key press during a snapshot): go back, never crash
         p = self.page
         out = {"home": p_home, "room": p_room, "detail": p_detail, "scenes": p_scenes, "autos": p_autos,
                "status": p_status}[p[0]](self)
@@ -463,7 +471,9 @@ class UI:
         elif op == "scene":
             self.request({"op": "scene", "id": a[1]}, [], ident, "scene", now)
         elif op == "trigger":  # id, enabled
-            trig = next(t for h in m.homes for t in h["triggers"] if t["id"] == a[1])
+            trig = next((t for h in m.homes for t in h["triggers"] if t["id"] == a[1]), None)
+            if trig is None:  # the automation vanished since the key was drawn
+                return
             was = trig["enabled"]
             trig["enabled"] = a[2]
             self.request({"op": "trigger", "id": a[1], "enabled": a[2]},
@@ -700,11 +710,19 @@ def p_detail(ui):
     return place(out, items, 1, n)
 
 
+def mark_dups(items):
+    """[(Key, owner, room name)] to keys. A name that more than one owner shows gets the room as a second small line."""
+    owners = {}
+    for k, owner, _ in items:
+        owners.setdefault(k.label.casefold(), set()).add(owner)
+    return [k._replace(note=room) if len(owners[k.label.casefold()]) > 1 else k for k, _, room in items]
+
+
 def p_scenes(ui):
     out = [EMPTY] * 15
     out[0] = back_key()
-    return place(out, [Key(s["name"], "play", BLUE, ident=f"scene:{s['id']}", tap=("scene", s["id"]))
-                       for s in ui.home()["scenes"]], 1, ui.page[1])
+    return place(out, mark_dups([(Key(s["name"], "play", BLUE, ident=f"scene:{s['id']}", tap=("scene", s["id"])), s["id"], s.get("room", ""))
+                                 for s in ui.home()["scenes"]]), 1, ui.page[1])
 
 
 def p_autos(ui):
@@ -718,12 +736,16 @@ def p_status(ui):
     m = ui.model
     out = [EMPTY] * 15
     out[0] = back_key()
-    items = [dev_key(ui, d)._replace(tap=None, hold=None, long=None, hint="") for d in ui.devs() if d.kind in SENSORS]
+    rooms = {r["id"]: r["name"] for r in ui.home()["rooms"]}
+    room = lambda a: rooms.get(m.accs[a]["room"], "")
+    items = [(dev_key(ui, d)._replace(tap=None, hold=None, long=None, hint=""), d.acc, room(d.acc)) for d in ui.devs() if d.kind in SENSORS]
     accs = {d.acc for d in ui.devs()}
     names = lambda ids: sorted(ids, key=lambda a: (m.accs[a]["name"].lower(), a))
-    items += [Key(m.accs[a]["name"], "alert", GREY, badge="!", ident=f"acc:{a}", tap=("room_of", a)) for a in names(a for a in accs if not m.reachable(a))]
-    items += [Key(m.accs[a]["name"], "battery", DARK, low=True, ident=f"acc:{a}", tap=("room_of", a)) for a in names(a for a in accs if m.low(a))]
-    return place(out, items, 1, ui.page[1])
+    items += [(Key(m.accs[a]["name"], "alert", GREY, badge="!", ident=f"acc:{a}", tap=("room_of", a)), a, room(a))
+              for a in names(a for a in accs if not m.reachable(a))]
+    items += [(Key(m.accs[a]["name"], "battery", DARK, low=True, ident=f"acc:{a}", tap=("room_of", a)), a, room(a))
+              for a in names(a for a in accs if m.low(a))]
+    return place(out, mark_dups(items), 1, ui.page[1])
 
 
 # --- drawing ---
@@ -759,15 +781,10 @@ def wrap(text, f, width=68, n=2):
     for part in text.split("\n"):
         cur = ""
         for word in part.split():
-            while f.getlength(word) > width:  # a word wider than the key breaks
-                k = max(1, len(word) - 1)
-                while k > 1 and f.getlength(word[:k]) > width:
-                    k -= 1
-                if cur:
-                    rows.append(cur)
-                    cur = ""
-                rows.append(word[:k])
-                word = word[k:]
+            if f.getlength(word) > width:  # a word never breaks: it ends with an ellipsis (fit() shrinks the font first)
+                while word and f.getlength(word + "…") > width:
+                    word = word[:-1]
+                word += "…"
             if cur and f.getlength(f"{cur} {word}") > width:
                 rows.append(cur)
                 cur = ""
@@ -780,6 +797,15 @@ def wrap(text, f, width=68, n=2):
             last = last[:-1]
         rows[-1] = last.rstrip() + "…"
     return rows
+
+
+def fit(text, size, width=68, n=2, floor=9):
+    """(font, rows): `text` at `size`, or at the largest smaller size down to `floor` px where no word is wider
+    than `width`. Only a word that still does not fit ends with an ellipsis (see wrap)."""
+    words = text.split()
+    while size > floor and any(font(size).getlength(w) > width for w in words):
+        size -= 1
+    return font(size), wrap(text, font(size), width, n)
 
 
 def glyph(d, name, cx, cy, size, fg):
@@ -1066,16 +1092,18 @@ def face(key, size=72, theme=None):
         # Layout at 72 px. Zone A (y 0-40): an icon (26 px) or a value (20 px bold), or a small 14 px icon at the
         # top left plus the value. Zone B (y 40-68): the label, at most 2 lines of 11 px. The bar is at the very bottom.
         if key.glyph is None and not key.sub:  # text only: centered
-            f = font(15)
-            rows = wrap(key.label, f, 64, 4)
+            f, rows = fit(key.label, 15, 64, 4)
             if len(rows) > 2:
-                f = font(12)
-                rows = wrap(key.label, f, 64, 4)
+                f, rows = fit(key.label, 12, 64, 4)
             d.multiline_text((size / 2, size / 2), "\n".join(rows), font=f, fill=ink, anchor="mm", align="center")
         else:
             baseline = size - 11 if key.bar is not None else size - 7  # last label line; its descenders end above the bar
-            for i, row in enumerate(reversed(wrap(key.label, font(11), 68, 2))):
-                d.text((size / 2, baseline - i * 13), row, font=font(11), fill=txt, anchor="ms")
+            if key.note:  # second small line: the label keeps one line above it
+                d.text((size / 2, baseline), wrap(key.note, font(9), 68, 1)[0], font=font(9), fill=txt, anchor="ms")
+                baseline -= 11
+            f, rows = fit(key.label, 11, 68, 1 if key.note else 2)
+            for i, row in enumerate(reversed(rows)):
+                d.text((size / 2, baseline - i * 13), row, font=f, fill=txt, anchor="ms")
             if key.sub:
                 px = 20
                 while px > 10 and font(px, "bold").getlength(key.sub) > 64:
@@ -1408,26 +1436,97 @@ def hacc(id, name, room, services, reachable=True):
     return {"id": id, "name": name, "room": room, "reachable": reachable, "services": services}
 
 
-def merge(parts):
-    """[(source, online, {"rooms", "accessories", "scenes", "triggers"})] to one home.
-    Rooms with the same name (any case) from different sources become one room. A source that is
-    offline marks its accessories unreachable."""
-    names, order, accs, scenes, trigs = {}, [], [], [], []
-    rid = lambda n: "room:" + (n or "Other").strip().casefold()
+class Names:
+    """Optional user file names.json: aliases for devices, rooms and scenes, and glob patterns to hide them.
+    {"devices": {"<hub name or prefixed id>": "alias"}, "rooms": {...}, "scenes": {...}, "hide": ["pattern"]}
+    No file: nothing is renamed and DEFAULT_HIDE is hidden. A file without "hide" hides nothing.
+    Names(None) has no file (tests). check() loads the file again when its mtime changed."""
+
+    def __init__(self, path=NAMES_FILE):
+        self.path, self.stamp = path, False  # False never equals a real mtime or None (no file)
+        self.load({})
+        self.check()
+
+    def load(self, raw):
+        table = lambda key: {str(a): str(b) for a, b in raw[key].items()} if isinstance(raw.get(key), dict) else {}
+        hide = raw.get("hide", [])
+        self.data = {"devices": table("devices"), "rooms": table("rooms"), "scenes": table("scenes"),
+                     "hide": [str(p) for p in hide] if isinstance(hide, list) else []}  # one assignment: threads see all or nothing
+
+    def check(self):
+        """Read the file again when its mtime changed. True when the names changed. A broken file is logged
+        once and the last good names stay."""
+        if self.path is None:
+            return False
+        try:
+            stamp = os.stat(self.path).st_mtime_ns
+        except OSError:
+            stamp = None
+        if stamp == self.stamp:
+            return False
+        self.stamp = stamp
+        raw = {"hide": DEFAULT_HIDE}
+        if stamp is not None:
+            try:
+                with open(self.path) as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError("the top level must be an object")
+            except (OSError, ValueError) as error:
+                log(f"names.json: {describe(error)}. The last good names stay.")
+                return False
+        self.load(raw)
+        return True
+
+    def device(self, id, name):
+        d = self.data["devices"]
+        return d.get(id) or d.get(name) or name
+
+    def room(self, name):
+        return self.data["rooms"].get(name) or name
+
+    def scene(self, id, name):
+        d = self.data["scenes"]
+        return d.get(id) or d.get(name) or name
+
+    def hidden(self, *names):
+        """True when a pattern of `hide` matches one of the names (hub name or alias; case does not matter)."""
+        return any(fnmatch.fnmatchcase(n.casefold(), p.casefold()) for n in names if n for p in self.data["hide"])
+
+
+def merge(parts, names=None):
+    """[(source, online, {"rooms", "accessories", "scenes", "triggers"})] to one home, with the aliases and hidden
+    items of `names`. Room aliases apply first, then rooms with the same name (any case) from different sources
+    become one room. A hidden room hides its devices. A source that is offline marks its accessories unreachable."""
+    names = names or Names(None)
+    nm, order, accs, scenes, trigs = {}, [], [], [], []
+
+    def room(n):
+        """(id, name) of a room after aliasing, or None when it is hidden."""
+        shown = (names.room(n) if n else n) or "Other"
+        return None if names.hidden(n, shown) else ("room:" + shown.strip().casefold(), shown.strip())
+
     for _, online, p in parts:
         for n in p["rooms"]:
-            names.setdefault(rid(n), (n or "Other").strip())
-            order.append(rid(n))
+            if r := room(n):
+                nm.setdefault(*r)
+                order.append(r[0])
         for a in p["accessories"]:
-            r = rid(a["room"])
-            names.setdefault(r, (a["room"] or "Other").strip())
-            order.append(r)
-            accs.append({**a, "room": r, "reachable": a["reachable"] and online})
-        scenes += p["scenes"]
+            r, name = room(a["room"]), names.device(a["id"], a["name"])
+            if r is None or names.hidden(a["name"], name):
+                continue
+            nm.setdefault(*r)
+            order.append(r[0])
+            svcs = [{**s, "name": name + s["name"][len(a["name"]):]} if s["name"].startswith(a["name"]) else s for s in a["services"]]
+            accs.append({**a, "name": name, "services": svcs, "room": r[0], "reachable": a["reachable"] and online})
+        for s in p["scenes"]:
+            name = names.scene(s["id"], s["name"])
+            if not names.hidden(s["name"], name):
+                scenes.append({**s, "name": name, "room": names.room(s["room"]) if s.get("room") else ""})
         trigs += p["triggers"]
     used = {a["room"] for a in accs}
     return {"id": "home", "name": "Home", "primary": True, "accessories": accs, "scenes": scenes, "triggers": trigs,
-            "rooms": [{"id": r, "name": names[r]} for r in dict.fromkeys(order) if r in used]}
+            "rooms": [{"id": r, "name": nm[r]} for r in dict.fromkeys(order) if r in used]}
 
 
 def snap_diff(old, new):
@@ -1444,7 +1543,7 @@ def snap_diff(old, new):
                 for c in s["chars"]:
                     shape.append((c["type"], c["min"], c["max"], c["step"], c["writable"], str(c.get("valid"))))
                     chars[(s["id"], c["type"])] = c["value"]
-        shape += [(r["id"], r["name"]) for r in h["rooms"]] + [(s["id"], s["name"]) for s in h["scenes"]]
+        shape += [(r["id"], r["name"]) for r in h["rooms"]] + [(s["id"], s["name"], s.get("room")) for s in h["scenes"]]
         shape += [(t["id"], t["name"], t["enabled"]) for t in h["triggers"]]
         return shape, chars, reach
 
@@ -1501,6 +1600,7 @@ class Source:
     name = label = ""
     delay = COALESCE
     interval = 0.0  # seconds between two requests of a batch
+    periodic = True  # a thread fetches everything every FULL_REFRESH seconds (tado polls on its own)
 
     def __init__(self, cfg, store):
         self.cfg, self.store = cfg, store
@@ -1513,6 +1613,22 @@ class Source:
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
+        if self.periodic:
+            threading.Thread(target=self._full, daemon=True).start()
+
+    def full_refresh(self):
+        """Fetch everything again, in case an event was missed. Offline: the loop fetches after it reconnects."""
+        if self.online:
+            try:
+                self.refresh()
+                self.notify()
+            except Exception as error:
+                log(f"{self.name}: {describe(error)}")
+
+    def _full(self):
+        while True:
+            time.sleep(FULL_REFRESH)
+            self.full_refresh()
 
     def _loop(self):
         wait = RETRY
@@ -1523,6 +1639,8 @@ class Source:
                 self.notify()
                 while True:  # stream() returns on a harmless timeout and raises on errors
                     self.stream()
+                    self.refresh()  # the stream is open again: events of the gap are lost, so fetch everything
+                    self.notify()
             except Exception as error:
                 log(f"{self.name}: {describe(error)}")
             self.online = False
@@ -1573,6 +1691,9 @@ class Source:
 
     def trigger(self, sid, enabled):
         return False
+
+
+HUE_GROUPS = {"room", "zone", "scene", "device"}  # an update of their children or services changes the structure
 
 
 class Hue(Source):
@@ -1637,7 +1758,7 @@ class Hue(Source):
 
     def apply_event(self, events):
         """Merge a message of the event stream into the cache. True when everything must be fetched
-        again (a resource was added or deleted)."""
+        again (a resource was added, deleted or renamed, or a room, zone, scene or device changed its members)."""
         again = False
         with self.lock:
             for ev in events if isinstance(events, list) else []:
@@ -1648,6 +1769,8 @@ class Hue(Source):
                     cur = self.res.get(r.get("type"), {}).get(r.get("id"))
                     if cur is not None:
                         deep_merge(cur, r)
+                    if "metadata" in r or (r.get("type") in HUE_GROUPS and ("children" in r or "services" in r)):
+                        again = True
         return again
 
     # --- model ---
@@ -1682,14 +1805,11 @@ class Hue(Source):
                 if any(short(s["type"]) in KINDS for s in svcs):
                     accs.append(hacc("hue:" + dev["id"], name, place.get(dev["id"]), svcs, reach))
             raw = [r for t in ("scene", "smart_scene") for r in g(t).values() if dig(r, "metadata", "name")]
-            count = Counter(r["metadata"]["name"] for r in raw)
             scenes = []
             for r in raw:
-                n = r["metadata"]["name"]
-                if count[n] > 1:  # same name in several rooms: add the room
-                    grp = R.get(dig(r, "group", "rtype"), {}).get(dig(r, "group", "rid"), {})
-                    n = f"{n}\n{dig(grp, 'metadata', 'name')}" if dig(grp, "metadata", "name") else n
-                scenes.append({"id": "hue:" + r["id"], "name": n, "kind": "custom"})
+                grp = R.get(dig(r, "group", "rtype"), {}).get(dig(r, "group", "rid"), {})
+                scenes.append({"id": "hue:" + r["id"], "name": r["metadata"]["name"], "kind": "custom",
+                               "room": dig(grp, "metadata", "name", default="")})  # the pages add the room to equal names
             trigs = [{"id": "hue:" + r["id"], "name": r["metadata"]["name"], "enabled": bool(r.get("enabled"))}
                      for r in g("behavior_instance").values() if dig(r, "metadata", "name")]
         return {"rooms": [n for n in rooms if n], "accessories": accs, "scenes": scenes, "triggers": trigs}
@@ -1905,8 +2025,9 @@ class Ikea(Source):
         with self.lock:
             if ev.get("type") == "deviceStateChanged" and isinstance(d, dict) and d.get("id") in self.dev:
                 deep_merge(self.dev[d["id"]], d)
-                return False
-        return ev.get("type") in ("deviceAdded", "deviceRemoved", "sceneCreated", "sceneUpdated", "sceneDeleted")
+                return "room" in d or "customName" in (dig(d, "attributes", default={}))  # renamed or moved: fetch again
+        return ev.get("type") in ("deviceAdded", "deviceRemoved", "sceneCreated", "sceneUpdated", "sceneDeleted",
+                                  "roomCreated", "roomUpdated", "roomDeleted")
 
     # --- model ---
 
@@ -2022,7 +2143,7 @@ class Tado(Source):
     """tado, cloud API. Free accounts get about 100 requests per day, so it polls every TADO_POLL seconds,
     refreshes once after a write and stops for the Retry-After time after HTTP 429."""
 
-    name, label, delay = "tado", "tado", TADO_COALESCE
+    name, label, delay, periodic = "tado", "tado", TADO_COALESCE, False
     HOST = "my.tado.com"
 
     def __init__(self, cfg, store):
@@ -2141,8 +2262,8 @@ class Hub:
     """The link of the UI for real hubs: runs the sources, merges them into one home and sends changes as
     snapshot, char and reach messages. Writes go to the source that owns the id prefix."""
 
-    def __init__(self, events, sources):
-        self.events, self.sources = events, sources
+    def __init__(self, events, sources, names=None):
+        self.events, self.sources, self.names = events, sources, names or Names(None)
         self.by_name = {s.name: s for s in sources}
         self.lock, self.last, self.was = threading.Lock(), None, False
         for s in sources:
@@ -2162,12 +2283,21 @@ class Hub:
     def start(self):
         for s in self.sources:
             s.start()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        """An edit of names.json shows within NAMES_POLL seconds, also when no hub sends an event."""
+        while True:
+            time.sleep(NAMES_POLL)
+            if self.names.check():
+                self.update()
 
     def snapshot(self):
-        return {"type": "snapshot", "homes": [merge([(s.name, s.online, s.translate()) for s in self.sources])]}
+        return {"type": "snapshot", "homes": [merge([(s.name, s.online, s.translate()) for s in self.sources], self.names)]}
 
     def update(self):
         """A source changed: send what differs from the last state."""
+        self.names.check()  # every refresh and event also looks at the mtime of names.json
         with self.lock:
             new = self.snapshot()
             msgs = [("msg", copy.deepcopy(new))] if self.last is None else snap_diff(self.last, new)
@@ -2348,7 +2478,7 @@ def run(deck, events, link):
 def paired_hub(events, skip=()):
     """The Hub of all paired hubs (except the `skip` names), not started yet."""
     store = Creds()
-    return Hub(events, [cls(cfg, store) for name, cls in SOURCES.items() if name not in skip and (cfg := store.get(name))])
+    return Hub(events, [cls(cfg, store) for name, cls in SOURCES.items() if name not in skip and (cfg := store.get(name))], Names())
 
 
 def serve(demo=False):
@@ -2534,7 +2664,13 @@ def test_hubs():
         kinds = {short(s["type"]): {short(c["type"]): c["value"] for c in s["chars"]} for s in by["Hall sensor"]["services"]}
         assert kinds["85"] == {MOTION: True} and kinds["8A"] == {CURT: 19.25} and kinds["84"][LUX] == 100.0 and kinds["96"] == {BATLVL: 12}
         assert {short(c["type"]): c["value"] for c in by["Door sensor"]["services"][0]["chars"]} == {CONTACT: 1}
-        assert [s["name"] for s in t["scenes"]] == ["Relax\nLiving Room", "Relax\nHall", "Wake up"] and t["scenes"][0]["id"] == "hue:s1"
+        assert [(s["name"], s["room"]) for s in t["scenes"]] == [("Relax", "Living Room"), ("Relax", "Hall"), ("Wake up", "Hall")]
+        assert t["scenes"][0]["id"] == "hue:s1"
+        # a Hue plug is an outlet: on/off only, whichever of the two archetypes says plug
+        for plug, arch in ((True, None), (False, "plug")):
+            r = {"id": "x", "on": {"on": True}, "dimming": {"brightness": 50}, "metadata": {"archetype": arch}}
+            svc = hue.light_service("hue:x", r, "Plug", plug)
+            assert short(svc["type"]) == "47" and [short(c["type"]) for c in svc["chars"]] == [ON]
         assert t["triggers"] == [{"id": "hue:b1", "name": "Sunset", "enabled": True}, {"id": "hue:b2", "name": "Away", "enabled": False}]
         # Hue: write translation, ct mode, gamut, group writes
         assert hue.light_body("l1", {ON: True, BRI: 30}) == {"on": {"on": True}, "dimming": {"brightness": 30.0}}
@@ -2700,8 +2836,104 @@ def test_hubs():
         assert seen == [{"k": {BRI: 40}, "k2": {ON: True}}] and results == [True] * 5, (seen, results)
 
 
+def test_names():
+    lamp = lambda id, name, room, reach=True: hacc(id, name, room, [hsvc(id + ":l", name, "43", [hchar(ON, False)])], reach)
+    sensor = hacc("hue:s", "Hall sensor", "Woonkamer", [hsvc("hue:s:t", "Hall sensor temperature", "8A", [hchar(CURT, 20.0, "float", w=False)])])
+    scene = lambda id, name, room="": {"id": id, "name": name, "kind": "custom", "room": room}
+    parts = [("hue", True, {"rooms": ["Woonkamer"], "accessories": [lamp("hue:1", "Hanglamp", "Woonkamer"), sensor],
+                            "scenes": [scene("hue:a", "Relax", "Woonkamer"), scene("hue:b", "Relax", "Garage")], "triggers": []}),
+             ("ikea", True, {"rooms": ["Woonkamer", "Garage"], "triggers": [],
+                             "accessories": [lamp("ikea:a", "Bureau", "Garage", False), lamp("ikea:b", "Bureau", "Woonkamer", False)],
+                             "scenes": [scene("ikea:s1", "dirigera_integration_x"), scene("ikea:s2", "Avond")]})]
+    has = lambda home: {a["id"]: a["name"] for a in home["accessories"]}
+    # no aliases, no hide: everything stays, rooms merge by name
+    home = merge(parts)
+    assert [r["name"] for r in home["rooms"]] == ["Woonkamer", "Garage"] and len(home["scenes"]) == 4 and len(home["accessories"]) == 4
+    # aliases: by hub name, by prefixed id (two devices share a name), rooms before the merge, scenes; services follow the device
+    n = Names(None)
+    n.load({"devices": {"Hanglamp": "Kitchen pendant", "ikea:b": "Desk", "Hall sensor": "Hallway sensor"},
+            "rooms": {"Woonkamer": "Living room"}, "scenes": {"Avond": "Evening", "hue:b": "Relax 2"}, "hide": ["dirigera_integration_*"]})
+    home = merge(parts, n)
+    assert has(home) == {"hue:1": "Kitchen pendant", "hue:s": "Hallway sensor", "ikea:a": "Bureau", "ikea:b": "Desk"}, has(home)
+    assert next(a for a in home["accessories"] if a["id"] == "hue:s")["services"][0]["name"] == "Hallway sensor temperature"
+    assert [r["name"] for r in home["rooms"]] == ["Living room", "Garage"], home["rooms"]
+    assert [(s["name"], s["room"]) for s in home["scenes"]] == [("Relax", "Living room"), ("Relax 2", "Garage"), ("Evening", "")]
+    # hide: globs on the hub name or the alias, for devices, scenes and rooms (a hidden room hides its devices)
+    n.load({"hide": ["Bu*", "dirigera_*", "kitchen*"], "devices": {"Hanglamp": "Kitchen pendant"}})
+    home = merge(parts, n)
+    assert has(home) == {"hue:s": "Hall sensor"} and [s["name"] for s in home["scenes"]] == ["Relax", "Relax", "Avond"], has(home)
+    n.load({"hide": ["garage"]})
+    home = merge(parts, n)
+    assert [r["name"] for r in home["rooms"]] == ["Woonkamer"] and set(has(home)) == {"hue:1", "hue:s", "ikea:b"}
+    # the default hide list applies without a file only; a file without "hide" hides nothing
+    assert Names("/nonexistent/names.json").hidden("dirigera_integration_emma") and not Names(None).hidden("dirigera_integration_emma")
+    # the file: aliases load, an edit shows when the mtime changes, a broken file keeps the last good names
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "names.json")
+        with open(path, "w") as f:
+            json.dump({"devices": {"Hanglamp": "A"}}, f)
+        n = Names(path)
+        assert n.device("hue:1", "Hanglamp") == "A" and not n.hidden("dirigera_integration_x") and n.check() is False
+        for text, alias, changed in (('{"devices": {"Hanglamp": "B"}}', "B", True), ("{broken", "B", False), ('[1]', "B", False)):
+            with open(path, "w") as f:
+                f.write(text)
+            os.utime(path, ns=(n.stamp + 10**9, n.stamp + 10**9))
+            assert n.check() is changed and n.device("hue:1", "Hanglamp") == alias, text
+        # the hub picks the edit up on its next update, without a restart
+        events = queue.Queue()
+        src = Hue({"host": "h", "pin": "p", "key": "k"}, None)
+        src.load(hue_sample())
+        src.online = True
+        hub = Hub(events, [src], n)
+        hub.update()
+        drain(events)
+        with open(path, "w") as f:
+            json.dump({"devices": {"Hanglamp": "C", "Floor lamp": "Standing lamp"}}, f)
+        os.utime(path, ns=(n.stamp + 10**9, n.stamp + 10**9))
+        hub.update()
+        assert "Standing lamp" in has(next(m[1] for m in drain(events) if m[0] == "msg" and m[1]["type"] == "snapshot")["homes"][0]).values()
+    # pages: equal names get the room as a second small line, on the scenes page and on the status page
+    ui = UI(Stub(), 0.0)
+    ui.on_msg({"type": "snapshot", "homes": [merge(parts, Names(None))]}, 0.0)
+    ui.stack = [("home", 0), ("scenes", 0)]
+    assert [(k.label, k.note) for k in ui.keys(0)[1:7]] == [("Relax", "Woonkamer"), ("Relax", "Garage"), ("dirigera_integration_x", ""), ("Avond", ""),
+                                                             ("", ""), ("", "")]
+    ui.stack = [("home", 0), ("status", 0)]
+    assert [(k.label, k.note) for k in ui.keys(0) if k.badge == "!"] == [("Bureau", "Garage"), ("Bureau", "Woonkamer")]
+    # the label fits: a long word shrinks to 9 px before it ends with an ellipsis, and it never breaks mid-word
+    f, rows = fit("Koffieapparaat", 11)
+    assert rows == ["Koffieapparaat"] and f.size < 11 and f.getlength(rows[0]) <= 68
+    f, rows = fit("Koffieapparaatmetheleveelletters", 11)
+    assert f.size == 9 and len(rows) == 1 and rows[0].endswith("…") and f.getlength(rows[0]) <= 68
+    assert fit("Spot keukenrek", 11)[1] == ["Spot", "keukenrek"] and fit("Spot keukenrek", 11)[0].size == 11
+    # structure events: renames, room changes, members
+    hue = Hue({"host": "h", "pin": "p", "key": "k"}, None)
+    hue.load(hue_sample())
+    upd = lambda **r: hue.apply_event([{"type": "update", "data": [r]}])
+    assert upd(id="l1", type="light", on={"on": False}) is False
+    assert upd(id="d1", type="device", metadata={"name": "New name"}) is True
+    assert upd(id="r1", type="room", children=[]) is True and upd(id="r1", type="room", services=[]) is True
+    assert upd(id="s1", type="scene", metadata={"name": "Other"}) is True and upd(id="z", type="zone", children=[]) is True
+    assert upd(id="x1", type="bridge", children=[]) is False
+    ikea = Ikea({"host": "i", "pin": "p", "token": "k"}, None)
+    ikea.load(IKEA_DEVICES, [])
+    ev = lambda **d: ikea.apply_event({"type": "deviceStateChanged", "data": {"id": "i1", **d}})
+    assert ev(attributes={"isOn": True}) is False and ev(attributes={"customName": "New"}) is True and ev(room={"name": "Hall"}) is True
+    assert all(ikea.apply_event({"type": t}) for t in ("roomCreated", "roomUpdated", "roomDeleted", "deviceRemoved", "sceneUpdated"))
+    # the full refresh runs for Hue and DIRIGERA, only while online; tado follows its poll interval
+    seen = []
+    hue.refresh, hue.notify = lambda: seen.append("refresh"), lambda: seen.append("notify")
+    hue.full_refresh()
+    assert seen == []
+    hue.online = True
+    hue.full_refresh()
+    assert seen == ["refresh", "notify"] and FULL_REFRESH == 600
+    assert Hue.periodic and Ikea.periodic and not Tado.periodic
+
+
 def test():
     test_hubs()
+    test_names()
     # UUIDs
     assert short("0000004A-0000-1000-8000-0026BB765291") == "4A" and short("0000000E-0000-1000-8000-0026BB765291") == "E"
     assert short("ABCD1234-0000-0000-0000-000000000000") == "ABCD1234-0000-0000-0000-000000000000"
@@ -2821,6 +3053,15 @@ def test():
     gone["homes"][0]["rooms"] = [r for r in gone["homes"][0]["rooms"] if r["id"] != "office"]
     ui3.on_msg(gone, 12)
     assert ui3.stack == [("home", 0)]
+    # a device vanishes while its detail page is open: back to the room (one level up), no crash
+    ui3.stack = [("home", 0), ("room", "living", 0), ("detail", "floor", 0)]
+    gone = fake_snapshot()
+    gone["homes"][0]["accessories"] = [a for a in gone["homes"][0]["accessories"] if a["id"] != "acc-floor"]
+    ui3.on_msg(gone, 13)
+    assert ui3.stack == [("home", 0), ("room", "living", 0)] and ui3.keys(13)[0].label == "Back"
+    ui3.stack = [("home", 0), ("detail", "floor", 0)]  # a stale page, for example a key press during the snapshot
+    assert ui3.keys(14)[0].label != "Back" and ui3.stack == [("home", 0)]
+    ui3.act(("trigger", "gone", True), "", 14)  # an automation that vanished: nothing happens
     # trigger toggle: optimistic and revert
     ui4 = test_ui()
     ui4.act(("trigger", "trig-1", False), "trigger:trig-1", 0)
@@ -3168,6 +3409,34 @@ def status():
             print(f"{name:5} paired, not reachable ({describe(error)})")
 
 
+def names_cmd():
+    """List every room, device and scene: kind, source, id, hub name, and "-> alias" or "(hidden)" from names.json.
+    Copy the hub name or the id into names.json. tado is left out, like in shots --live (rotating token)."""
+    store, names = Creds(), Names()
+    rows = []
+    for name, cls in SOURCES.items():
+        cfg = None if name == "tado" else store.get(name)
+        if not cfg:
+            continue
+        try:
+            src = cls(cfg, store)
+            src.refresh()
+            t = src.translate()
+        except Exception as error:
+            print(f"{name:5} not reachable ({describe(error)})")
+            continue
+        shown = lambda kind, id, hub, now: rows.append((kind, name, id, hub, now, names.hidden(hub, now)))
+        for r in dict.fromkeys(t["rooms"] + [a["room"] for a in t["accessories"] if a["room"]]):
+            shown("room", "-", r, names.room(r))
+        for a in sorted(t["accessories"], key=lambda a: (a["name"].lower(), a["id"])):
+            shown("device", a["id"], a["name"], names.device(a["id"], a["name"]))
+        for s in t["scenes"]:
+            shown("scene", s["id"], s["name"], names.scene(s["id"], s["name"]))
+    print(f"names.json: {names.path} ({'found' if names.stamp else 'not found'})")
+    for kind, source, id, hub, now, hide in sorted(rows, key=lambda r: ("room device scene".split().index(r[0]), r[1])):
+        print(f"{kind:6} {source:5} {id:40} {hub}" + (f" -> {now}" if now != hub else "") + (" (hidden)" if hide else ""))
+
+
 def unpair(name):
     store = Creds()
     print(f"Forgot {name}." if store.get(name) else f"{name} was not paired.")
@@ -3180,7 +3449,8 @@ def main(argv=None):
     p.add_argument("--theme", choices=THEMES, help="key look (default graphite, or STREAM_DECK_HOME_THEME)")
     sub = p.add_subparsers(dest="cmd")
     for name, text in (("serve", "run the deck (default)"), ("demo", "run the deck on a fake home"),
-                       ("test", "self-check without hardware"), ("status", "paired hubs and counts")):
+                       ("test", "self-check without hardware"), ("status", "paired hubs and counts"),
+                       ("names", "list rooms, devices and scenes with source, id and current name (not tado)")):
         sub.add_parser(name, help=text)
     sh = sub.add_parser("shots", help="write PNG renders to a folder (default /tmp)")
     sh.add_argument("folder", nargs="?", default="/tmp")
@@ -3195,7 +3465,7 @@ def main(argv=None):
     THEME = args.theme or os.environ.get("STREAM_DECK_HOME_THEME") or THEME
     if THEME not in THEMES:
         sys.exit(f"Unknown theme {THEME!r}. Use one of: {', '.join(THEMES)}.")
-    {"serve": serve, "demo": lambda: serve(True), "test": test, "status": status, None: serve,
+    {"serve": serve, "demo": lambda: serve(True), "test": test, "status": status, "names": names_cmd, None: serve,
      "shots": lambda: (shots_live if args.live else shots)(args.folder), "pair": lambda: PAIR[args.source](args.host),
      "unpair": lambda: unpair(args.source)}[args.cmd]()
 
