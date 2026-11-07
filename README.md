@@ -34,15 +34,16 @@ Stream Deck <--USB--> hubdeck.py --+--HTTPS + SSE-->        Hue Bridge
 
 ## Installation
 
-Planned, with the tap pattern of `~/Code/tinker-lab/homebrew-tap` (not published yet):
+With Homebrew:
 
 ```sh
 brew install elmarbeckmann/tap/hubdeck
 brew services start hubdeck
 ```
 
-The formula will copy `hubdeck.py` to `libexec` and write a `hubdeck` command that runs
-`uv run --script`, like `stream-deck-eq`.
+The formula installs `uv` and `hidapi`. It copies `hubdeck.py` and `hubdeck.py.lock` to `libexec` and
+writes a `hubdeck` command that runs `uv run --script`. `brew services` runs `hubdeck serve` at login
+and writes to the log `$(brew --prefix)/var/log/hubdeck.log`.
 
 From source:
 
@@ -459,7 +460,7 @@ make uninstall
 
 `make uninstall` stops the launch agent `dev.elmar.hubdeck` and removes its plist, the command
 `~/.local/bin/hubdeck` and the folder `~/.local/share/hubdeck`. It does not remove
-the credentials or the log. With Homebrew (not published yet): `brew services stop hubdeck`
+the credentials or the log. With Homebrew: `brew services stop hubdeck`
 and `brew uninstall hubdeck`. Remove the folder `~/.config/hubdeck` when you do not
 need the credentials any more. Remove the log `~/Library/Logs/hubdeck.log` too. `unpair`
 deletes only the local token, so remove the access keys on the hubs too (see "Other commands").
